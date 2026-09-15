@@ -50,6 +50,9 @@ Option Explicit
 '    WriteSAFETable(TableKey, Data, ...)    : writes a 2-D array BACK into SAFE
 '                                             (edit + apply). Optional bonus.
 '    SAFEConnect / SAFEDisconnect           : attach / release the running SAFE
+'    LastErrorNumber() / LastErrorDescription() / LastErrorContext() /
+'    LastErrorText()                        : the last error that was recorded
+'                                             by LogError / SetLastError (below)
 '
 '  TABLE KEYS are the same strings shown in SAFE's "Display > Show Tables",
 '  e.g. "Point Object Connectivity", "Area Load Assignments - Uniform",
@@ -73,6 +76,16 @@ Option Explicit
 '      recommend saving the model BEFORE calling it. We check the error counts.
 '    - When attaching to a running instance, NEVER call ApplicationExit
 '      (it would close the user's SAFE session).
+'    - CONNECTION ERRORS (Readme.txt troubleshooting): a "438 or 5" failure
+'      usually means the SAFEv1 reference is not ticked, or SAFE is not open /
+'      is busy analysing / is not locked. Every trappable error is recorded
+'      with its number AND its 8-digit HRESULT by LogError, and can be read
+'      back with LastErrorNumber / LastErrorDescription / LastErrorContext.
+'    - SAFEConnect() PROVES the link is live before reporting success, by
+'      calling SapModel.GetModelFilepath() - a cheap read-only call. A stale
+'      Running Object Table entry (SAFE closed or crashed after connecting)
+'      survives the GetObject attach and only fails on first use, so without
+'      the probe a dead proxy could be cached as "connected".
 ' ============================================================================
 
 ' ---------------------------------------------------------------------------
@@ -110,46 +123,105 @@ Private gDB As cDatabaseTables   ' database tables (cached)
 Private gConnected As Boolean
 Private gLog As String
 
+' Last error recorded by LogError / SetLastError (see the LOGGING section).
+Private gLastErrNumber As Long
+Private gLastErrSource As String
+Private gLastErrDesc As String
+Private gLastErrContext As String
+
 ' ===========================================================================
 ' CONNECTION - attach to the running SAFE instance
 ' ===========================================================================
 
 Public Function SAFEConnect() As Boolean
     Dim helper As cHelper
+    Dim ret1 As Long, desc1 As String
+    Dim ret2 As Long, desc2 As String
+    Dim modelPath As String
 
-    ' Strategy 1: attach to the running instance through the ROT.
+    ' Strategy 1: attach to the running instance through the Running Object
+    ' Table (VBA's GetObject with an empty path). The error NUMBER is recorded
+    ' rather than discarded: "no active instance" is expected here, but shares
+    ' its error numbers (429 / 0x800401E3) with genuine failures, so it has to
+    ' be visible in the log.
     On Error Resume Next
+    Err.Clear
     Set gSAFE = GetObject(, SAFE_PROGID)
+    ret1 = Err.Number
+    desc1 = Err.Description
     On Error GoTo 0
 
     ' Strategy 2: via the API Helper object (documented early-bound approach).
+    ' Unlike GetObject it returns Nothing instead of raising when no instance is
+    ' registered - any error is still recorded.
     If gSAFE Is Nothing Then
         On Error Resume Next
+        Err.Clear
         Set helper = New Helper
-        If Not helper Is Nothing Then
+        ret2 = Err.Number
+        desc2 = Err.Description
+        If ret2 = 0 And Not helper Is Nothing Then
             Set gSAFE = helper.GetObject(SAFE_PROGID)
+            ret2 = Err.Number
+            desc2 = Err.Description
         End If
         On Error GoTo 0
+        Set helper = Nothing
     End If
 
     If gSAFE Is Nothing Then
+        If ret1 <> 0 Then
+            LogMsg "SAFEConnect: strategy 1 (GetObject via the ROT) failed - " & _
+                   ErrorText(ret1, desc1)
+        Else
+            LogMsg "SAFEConnect: strategy 1 (GetObject via the ROT) found no instance."
+        End If
+        If ret2 <> 0 Then
+            LogMsg "SAFEConnect: strategy 2 (API Helper) failed - " & _
+                   ErrorText(ret2, desc2)
+        End If
         LogMsg "SAFEConnect: no running SAFE instance found." & vbCrLf & _
-               "Start SAFE, open the model, and try again."
+               "Start SAFE, open the model, and try again." & vbCrLf & _
+               "  " & ErrHint(438)
         SAFEConnect = False
         Exit Function
     End If
 
+    ' Bind the model + database-table objects, then PROVE the connection is
+    ' live with a cheap, read-only call. A stale Running Object Table entry
+    ' still resolves here and only fails on first use.
     On Error GoTo Fail
     Set gSapModel = gSAFE.SapModel
-    If gSapModel Is Nothing Then GoTo Fail
+    If gSapModel Is Nothing Then
+        SetLastError "SAFEConnect", "the attached instance exposed no SapModel object " & _
+                     "(stale or incompatible SAFE instance)."
+        GoTo Fail
+    End If
+
+    modelPath = gSapModel.GetModelFilepath()      ' fast, read-only liveness probe
+
     Set gDB = gSapModel.DatabaseTables
+    If gDB Is Nothing Then
+        SetLastError "SAFEConnect", "the attached instance exposed no DatabaseTables object."
+        GoTo Fail
+    End If
+
     gConnected = True
-    LogMsg "Attached to running SAFE instance (progid: " & SAFE_PROGID & ")."
+    ClearLastError
+    If Len(modelPath) = 0 Then modelPath = "(untitled / unsaved model)"
+    LogMsg "Attached to running SAFE instance (progid: " & SAFE_PROGID & ")." & vbCrLf & _
+           "  Liveness probe OK (GetModelFilepath) - model: " & modelPath
     SAFEConnect = True
     Exit Function
 
 Fail:
-    LogMsg "SAFEConnect failed: " & Err.Description & " (" & Err.Number & ")"
+    ' LogError only records genuine COM failures; the explicit checks above
+    ' reach this label with Err.Number = 0 and have already been logged.
+    LogError "SAFEConnect", "Connection dropped (SAFE references released)."
+    gConnected = False
+    Set gDB = Nothing
+    Set gSapModel = Nothing
+    Set gSAFE = Nothing
     SAFEConnect = False
 End Function
 
@@ -217,6 +289,7 @@ Public Function ExportSAFETables( _
     written = 0
     Dim hdrs() As String
     Dim warn As String
+    Dim readError As Boolean
     Dim data As Variant
 
     ' --- optional load-case filter (saved and restored afterwards) ---
@@ -231,6 +304,10 @@ Public Function ExportSAFETables( _
     If nCases > 0 Then
         Dim getRet As Long
         getRet = gDB.GetLoadCasesSelectedForDisplay(savedCount, savedCases)
+        If getRet <> 0 Then
+            LogMsg "ExportSAFETables: GetLoadCasesSelectedForDisplay returned " & getRet & _
+                   " (the previous display selection will not be restored exactly)"
+        End If
         Dim setRet As Long
         setRet = gDB.SetLoadCasesSelectedForDisplay(caseNames)
         If setRet <> 0 Then
@@ -246,8 +323,13 @@ Public Function ExportSAFETables( _
         Dim key As String
         key = Trim(names(i))
         If Len(key) > 0 Then
-            data = SAFETableToArray(key, hdrs, warn)
-            If Len(warn) > 0 Then LogMsg "[" & key & "] " & warn
+            data = SAFETableToArray(key, hdrs, warn, readError)
+            If readError Then
+                ' Already logged inside SAFETableToArray, with the error number
+                ' and the matching hint - do not log it a second time.
+            ElseIf Len(warn) > 0 Then
+                LogMsg "[" & key & "] " & warn
+            End If
 
             If ArrLenStr(hdrs) > 0 Or Not IsEmpty(data) Then
                 ' Normal case: write title + headers + data block.
@@ -272,7 +354,7 @@ Public Function ExportSAFETables( _
 Fatal:
     RestoreLoadCaseFilter savedCases, savedCount, filterApplied
     Application.ScreenUpdating = savedScreen
-    LogMsg "ExportSAFETables fatal error: " & Err.Description & " (" & Err.Number & ")"
+    LogError "ExportSAFETables"
     ExportSAFETables = -1
 End Function
 
@@ -346,7 +428,7 @@ Public Function ListSAFETables( _
 
 Fatal:
     Application.ScreenUpdating = savedScreen
-    LogMsg "ListSAFETables fatal error: " & Err.Description & " (" & Err.Number & ")"
+    LogError "ListSAFETables"
     ListSAFETables = -1
 End Function
 
@@ -451,6 +533,10 @@ Public Function WriteSAFETable( _
     Exit Function
 
 Fail:
+    ' Record a genuine COM failure with its number. Deliberate validation
+    ' failures (bad table key, column mismatch, rejected edit) reach this label
+    ' with Err.Number = 0 - they were already logged where they were detected.
+    LogError "WriteSAFETable"
     WriteSAFETable = False
 End Function
 
@@ -461,13 +547,18 @@ End Function
 Private Function SAFETableToArray( _
     ByVal TableKey As String, _
     ByRef Headers() As String, _
-    ByRef Warning As String) As Variant
+    ByRef Warning As String, _
+    ByRef HadError As Boolean) As Variant
     ' Returns a 1-based 2-D Variant array [row, col] of data (headers excluded),
     ' or Empty when the table has nothing to write. Headers are filled in.
+    ' HadError is set when the call failed (as opposed to returning no data);
+    ' such a failure is logged here, with its error number, so the caller only
+    ' has to report the "empty table" case.
     On Error GoTo ErrHandler
 
     Erase Headers
     Warning = ""
+    HadError = False
 
     Dim ret As Long
     Dim FieldKeyList() As String
@@ -534,7 +625,15 @@ Private Function SAFETableToArray( _
     Exit Function
 
 ErrHandler:
-    Warning = "COM error " & Err.Number & ": " & Err.Description
+    ' Capture the error details in locals before calling any helper, so the
+    ' report cannot be invalidated by the Err object being overwritten.
+    Dim errNum As Long, errDesc As String
+    errNum = Err.Number
+    errDesc = Err.Description
+    HadError = True
+    Warning = ErrorText(errNum, errDesc)
+    LogMsg "[" & TableKey & "] read failed - " & Warning
+    If Len(ErrHint(errNum)) > 0 Then LogMsg "  " & ErrHint(errNum)
     SAFETableToArray = Empty
 End Function
 
@@ -648,11 +747,13 @@ Private Function NormalizeTables(ByVal Tables As Variant, ByRef names() As Strin
     Exit Function
 
 ErrH:
+    LogError "NormalizeTables", "The table-name / load-case argument could not be read."
     NormalizeTables = 0
 End Function
 
 ' Restore the load-case display selection that was in place before a filtered
-' export (best effort - the return code is ignored).
+' export. Best effort (a failure is not fatal) but any error NUMBER is logged,
+' because a failed restore leaves the filter changed in the user's session.
 ' Note (SAFE quirk): passing a single blank string selects NO load cases.
 Private Sub RestoreLoadCaseFilter( _
     ByRef savedCases() As String, _
@@ -664,11 +765,18 @@ Private Sub RestoreLoadCaseFilter( _
     Dim none(0 To 0) As String
     none(0) = ""
 
+    ' Best effort - but the error NUMBER is still recorded, because a failure
+    ' here leaves the display load-case filter changed in the user's SAFE session.
     On Error Resume Next
+    Err.Clear
     If savedCount > 0 And ArrLenStr(savedCases) > 0 Then
         gDB.SetLoadCasesSelectedForDisplay savedCases
     Else
         gDB.SetLoadCasesSelectedForDisplay none
+    End If
+    If Err.Number <> 0 Then
+        LogMsg "RestoreLoadCaseFilter: could not restore the display load-case " & _
+               "selection - " & ErrorText(Err.Number, Err.Description)
     End If
     On Error GoTo 0
 End Sub
@@ -720,8 +828,155 @@ Private Sub LogMsg(ByVal msg As String)
     Debug.Print msg
 End Sub
 
+' Record the current Err object and write it to the log.
+' The number is logged BOTH in decimal and as an 8-digit hexadecimal HRESULT,
+' because the decimal number VBA reports for a failed COM call depends on how
+' the call was marshalled (a stale or disconnected SAFE proxy surfaces as 5,
+' 438, 462 or -2147417846/-2147417848 depending on the path taken), while the
+' HRESULT identifies the real cause.
+' Nothing is recorded when Err.Number is 0, so callers can share a "Fail" label
+' between real errors and deliberate validation failures.
+Private Sub LogError(ByVal Context As String, Optional ByVal Extra As String = "")
+    If Err.Number = 0 Then Exit Sub
+
+    ' Capture the details in LOCALS first: the helper calls below are allowed to
+    ' raise (Error$(...)), and that would overwrite the Err object before we
+    ' have finished reporting on it.
+    Dim n As Long, d As String, src As String
+    n = Err.Number
+    d = Err.Description
+    src = Err.Source
+
+    gLastErrNumber = n
+    gLastErrContext = Context
+    gLastErrSource = src
+    gLastErrDesc = d
+
+    Dim msg As String, hint As String
+    msg = "ERROR in " & Context & ": " & ErrorText(n, d)
+    If Len(src) > 0 Then msg = msg & " [source: " & src & "]"
+    If Len(Extra) > 0 Then msg = msg & vbCrLf & "  " & Extra
+    hint = ErrHint(n)
+    If Len(hint) > 0 Then msg = msg & vbCrLf & "  " & hint
+    LogMsg msg
+End Sub
+
+' Record + log a failure that did NOT come from the Err object (for example an
+' API call that returned Nothing instead of raising). LastErrorNumber() is set
+' to 0 because there genuinely is no error number.
+Private Sub SetLastError(ByVal Context As String, ByVal Text As String)
+    gLastErrNumber = 0
+    gLastErrContext = Context
+    gLastErrSource = ""
+    gLastErrDesc = Text
+    LogMsg "ERROR in " & Context & ": " & Text & vbCrLf & "  " & ErrHint(438)
+End Sub
+
+Private Sub ClearLastError()
+    gLastErrNumber = 0
+    gLastErrSource = ""
+    gLastErrDesc = ""
+    gLastErrContext = ""
+End Sub
+
+' "438 (0x000001B6) - Object doesn't support this property or method"
+Private Function ErrorText(ByVal Number As Long, ByVal Description As String) As String
+    Dim d As String
+    d = Trim$(Description)
+    If Len(d) = 0 And Number > 0 And Number <= 65535 Then
+        ' Fall back to VBA's built-in text for standard errors. Only for valid
+        ' positive codes - Error$() raises for anything else (and would clobber
+        ' Err.) which is why it is guarded here.
+        On Error Resume Next
+        d = Trim$(Error$(Number))
+        On Error GoTo 0
+    End If
+
+    ErrorText = CStr(Number) & " (0x" & ErrHex(Number) & ")"
+    If Len(d) > 0 Then ErrorText = ErrorText & " - " & d
+End Function
+
+' 8-digit two's-complement hex for an error number: -2147417846 -> "8001010A".
+' Done with Double-based integer maths so it does not depend on how VBA's Hex()
+' treats negative values, and so the high bit does not overflow a Long.
+Private Function ErrHex(ByVal Number As Long) As String
+    Dim u As Double
+    Dim hi As Long, lo As Long
+
+    If Number < 0 Then
+        u = 4294967296# + Number          ' 2^32 + negative = unsigned 32-bit value
+    Else
+        u = Number
+    End If
+
+    hi = CLng(Int(u / 65536#))
+    lo = CLng(u - Int(u / 65536#) * 65536#)
+    ErrHex = Right$("000" & Hex$(hi), 4) & Right$("000" & Hex$(lo), 4)
+End Function
+
+' Guidance for the error numbers seen when a COM call to SAFE fails - mirrors
+' the troubleshooting in the pile-cap Readme.txt ("if it returns 438 or 5
+' error, check if the reference library for SAFE API is active... then check if
+' the SAFE application is open, not running analysis and locked so that the API
+' is active").
+Private Function ErrHint(ByVal Number As Long) As String
+    Select Case Number
+        Case 5, 438
+            ErrHint = "Hint: check that the 'SAFEv1' reference is ticked " & _
+                      "(VBA IDE > Tools > References...), then that SAFE is open " & _
+                      "with a model loaded, idle (not running analysis) and " & _
+                      "locked, so that the API is active."
+        Case 429, 424
+            ErrHint = "Hint: no live SAFE automation object was found. Is SAFE " & _
+                      "running in the same Windows session and at the same " & _
+                      "integrity level (elevation) as Excel?"
+        Case 462
+            ErrHint = "Hint: the SAFE instance stopped responding or was closed " & _
+                      "while the call was in flight. Call SAFEDisconnect, then " & _
+                      "SAFEConnect."
+        Case -2147417846              ' &H8001010A RPC_E_CALL_REJECTED
+            ErrHint = "Hint: SAFE rejected the call because it is busy (analysing, " & _
+                      "or showing a modal dialog). Wait until it is idle and retry."
+        Case -2147417848              ' &H80010108 RPC_E_DISCONNECTED
+            ErrHint = "Hint: the SAFE instance this module is attached to has " & _
+                      "exited. Call SAFEDisconnect, then SAFEConnect."
+    End Select
+End Function
+
+' ---------------------------------------------------------------------------
+' Last-error accessors (populated by LogError / SetLastError)
+' ---------------------------------------------------------------------------
+
+Public Function LastErrorNumber() As Long
+    ' Decimal VBA error number, or 0 if the failure had no error number.
+    LastErrorNumber = gLastErrNumber
+End Function
+
+Public Function LastErrorDescription() As String
+    LastErrorDescription = gLastErrDesc
+End Function
+
+Public Function LastErrorSource() As String
+    LastErrorSource = gLastErrSource
+End Function
+
+Public Function LastErrorContext() As String
+    ' Which procedure recorded the error, e.g. "SAFEConnect".
+    LastErrorContext = gLastErrContext
+End Function
+
+Public Function LastErrorText() As String
+    ' One-line summary, e.g. "SAFEConnect: 438 (0x000001B6) - Object doesn't "
+    ' "support this property or method"
+    If gLastErrNumber = 0 And Len(gLastErrDesc) = 0 Then Exit Function
+    LastErrorText = ErrorText(gLastErrNumber, gLastErrDesc)
+    If Len(gLastErrContext) > 0 Then _
+        LastErrorText = gLastErrContext & ": " & LastErrorText
+End Function
+
 Public Sub ClearLog()
     gLog = ""
+    ClearLastError
 End Sub
 
 Public Function GetLog() As String
