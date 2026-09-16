@@ -242,16 +242,20 @@ the column-header row is written, so the DATA lands **flush on `TopLeftCell`**
 `IncludeHeader:=True` for the labelled block — table key on the first row, column
 keys on the second — which moves the first data row **two** rows down.
 
-`WriteNodalReactions1` is the ready example: its settings are **local constants
-inside the sub** — `REACT_SHEET` / `REACT_TOPLEFT` (**top-left corner only**; the data
-lands there flush — no title row, no header row — and its columns extend right and
-down from there; a table too big for one sheet continues on `<sheet>_2`, `_3`, …),
-`REACT_LOADCASES` (cases, never combinations)
-and `REACT_TABLE` = `Joint Reactions`, verified against
-`reference/SAFE Input&Output Table Key List.csv` (Import Type 0 — a result table,
-so it can be read but never written back). A key that is wrong for the model writes
-nothing and marks the block bold red (`MarkTableFailed`) instead of exporting
-plausible-looking data.
+A site-specific entry point can also drive the two library halves itself, which is
+what `WriteNodalReactions1` does: after clearing the display combinations it reads
+`Joint Reactions` (verified against `reference/SAFE Input&Output Table Key
+List.csv`, Import Type 0 — a result table, so it can be read but never written
+back), drops every row whose `Fz` is zero, and prints what is left. Its settings
+are **local constants inside the sub** — `REACT_SHEET` / `REACT_TOPLEFT`
+(**top-left corner only**; the block lands there flush — no title row, no header
+row — and its columns extend right and down from there; a block too big for one
+sheet continues on `<sheet>_2`, `_3`, …), `REACT_LOADCASES` (cases, never
+combinations; empty = every load case the model reports) and `REACT_TABLE`. A key
+that is wrong for the model writes nothing and marks the block bold red
+(`MarkTableFailed`) instead of exporting plausible-looking data. The
+`Fz = 0` filter is one labelled block inside that sub, so it is the single place
+to change what rows reach the sheet.
 
 ## Table keys
 

@@ -124,9 +124,10 @@ End Sub
 ' ===========================================================================
 ' ENTRY POINTS - run these from Excel (Alt+F8)
 ' ===========================================================================
-' A wrapper is deliberately trivial: its LOCAL constants are the only
-' site-specific names anywhere, and it hands them to a worker. Copy one for any
-' other area - any number of wrappers can drive the same worker.
+' A wrapper keeps its own settings as LOCAL constants - the only site-specific
+' names anywhere - and either hands them to a worker (ApplyPileCoordinates1) or
+' drives the library's read / preprocess / print steps itself when the data has
+' to be worked on in between (WriteNodalReactions1). Copy one for any other area.
 Public Sub ApplyPileCoordinates1()
     ' ---- EDIT THESE --------------------------------------------------------
     ' Sheet and range that hold the coordinate table. The range must cover THREE
@@ -772,21 +773,22 @@ End Function
 ' ---------------------------------------------------------------------------
 ' NODAL REACTIONS - entry point; its settings are LOCAL constants inside it
 ' ---------------------------------------------------------------------------
-' Only the TOP-LEFT cell of the destination is given: the table lands there
-' FLUSH - no title row and no header row, because ReadResultTableForCases'
-' IncludeHeader defaults to False - and its columns extend right and down from
-' there. Pass IncludeHeader:=True for the labelled layout (table key + column
-' keys). A table too big for one worksheet continues on <REACT_SHEET>_2, _3, ...
-' (SAFE_Library does that, with a warning). Copy this sub - constants and all -
-' for another area, e.g. WriteNodalReactions2.
+' The table is READ into a 2-D array, the rows whose Fz is zero are dropped
+' (step 6 is the standalone place to change that), and what is left is PRINTED.
+' Only the TOP-LEFT cell of the destination is given: the block lands there
+' FLUSH - no title row and no header row - and its columns extend right and down
+' from there (a block too big for one worksheet continues on <REACT_SHEET>_2,
+' _3, ..., with a warning). Copy this sub - constants and all - for another
+' area, e.g. WriteNodalReactions2.
 Public Sub WriteNodalReactions1()
     ' ---- EDIT THESE --------------------------------------------------------
     Const REACT_SHEET As String = "Nodal Reactions"     ' <-- EDIT ME
     Const REACT_TOPLEFT As String = "B5"                ' <-- EDIT ME (corner only)
 
-    ' Load CASES to include - NOT load combinations: combinations are cleared for
-    ' the duration of the read, so a combination row cannot slip into this table.
-    ' Blank entries and duplicates are ignored; casing must match SAFE exactly.
+    ' Load CASES to include - NOT load combinations: the display load combinations
+    ' are cleared for the duration of the read, so a combination row cannot slip
+    ' into this table. Blank entries and duplicates are ignored; casing must match
+    ' SAFE exactly. EMPTY = every load case the model reports.
     Const REACT_LOADCASES As String = ""      ' <-- EDIT ME
 
     ' SAFE's nodal-reaction result table, verified against the shipped key list
@@ -798,7 +800,222 @@ Public Sub WriteNodalReactions1()
     Const REACT_TABLE As String = "Joint Reactions"     ' <-- from the key list CSV
     ' ------------------------------------------------------------------------
 
-    ReadResultTableForCases REACT_TABLE, REACT_LOADCASES, REACT_SHEET, REACT_TOPLEFT
+    Dim savedCombos() As String
+    Dim nSavedCombos As Long
+    Dim none(0 To 0) As String
+    Dim clearedCombos As Boolean
+    Dim resolvedCases As Variant
+    Dim allNames() As String
+    Dim allRuns() As Boolean
+    Dim nAll As Long
+    Dim ret As Long
+    Dim errNum As Long, errDesc As String
+    Dim reason As String
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+    Dim nRows As Long, nCols As Long
+    Dim ixFz As Long
+    Dim keepRow() As Byte
+    Dim kept() As Variant
+    Dim nKept As Long
+    Dim fzText As String
+    Dim r As Long, c As Long, k As Long
+    Dim printed As Long
+
+    none(0) = ""                       ' SAFE: a single blank = select NOTHING
+
+    ResetExportFailures
+    On Error GoTo Fail
+
+    ' ---- 1. attach (no-op when already attached) ---------------------------
+    If Not SAFEConnect() Then
+        Say "WriteNodalReactions1: could not attach to a running SAFE instance, " & _
+            "so nothing was read." & vbCrLf & vbCrLf & _
+            "Detail: " & LastErrorText(), vbExclamation
+        Exit Sub
+    End If
+
+    ' ---- 2. the load cases to read -----------------------------------------
+    ' SAFE's display filter can only select NAMES - there is no "all cases"
+    ' value - so an empty REACT_LOADCASES is turned into the model's own case
+    ' list. Entries are handed to SAFE as typed.
+    resolvedCases = REACT_LOADCASES
+    If IsEmptyNameArgument(REACT_LOADCASES) Then
+        On Error Resume Next
+        Err.Clear
+        ret = gSapModel.Analyze.GetRunCaseFlag(nAll, allNames, allRuns)
+        errNum = Err.Number
+        errDesc = Err.Description
+        On Error GoTo Fail
+
+        If errNum = 0 And ret = 0 And SelectedNameCount(allNames) > 0 Then
+            resolvedCases = allNames
+            LogMsg "WriteNodalReactions1: REACT_LOADCASES is empty - reading ALL " & _
+                   SelectedNameCount(allNames) & " load case(s) the model reports."
+        Else
+            resolvedCases = ""          ' no case filter; the display selection decides
+            LogMsg "WriteNodalReactions1: the model did not report its load case " & _
+                   "list (code " & ret & ", error " & errNum & " - " & errDesc & _
+                   ") - no load-case filter is applied."
+        End If
+    End If
+
+    ' ---- 3. clear the display load combinations (put back in step 5) -------
+    nSavedCombos = 0
+    Erase savedCombos
+    On Error Resume Next
+    Err.Clear
+    ret = gDB.GetLoadCombinationsSelectedForDisplay(nSavedCombos, savedCombos)
+    errNum = Err.Number
+    errDesc = Err.Description
+    On Error GoTo Fail
+
+    If errNum <> 0 Or ret <> 0 Then
+        LogMsg "WriteNodalReactions1: could not read the current display " & _
+               "load-combination selection (" & errNum & " / code " & ret & " - " & _
+               errDesc & ") - it is left as ""none selected""."
+        nSavedCombos = 0
+        Erase savedCombos
+    End If
+
+    On Error Resume Next
+    Err.Clear
+    ret = gDB.SetLoadCombinationsSelectedForDisplay(none)
+    errNum = Err.Number
+    errDesc = Err.Description
+    On Error GoTo Fail
+
+    If errNum <> 0 Or ret <> 0 Then
+        Say "WriteNodalReactions1: SAFE would not clear the display load " & _
+            "combinations (" & errNum & " / code " & ret & ")." & vbCrLf & vbCrLf & _
+            "The read goes ahead, but if a load combination is still selected in " & _
+            "SAFE's Show Tables, its rows are in the table as well as the load " & _
+            "cases.", vbExclamation
+    Else
+        clearedCombos = True
+    End If
+
+    ' ---- 4. read the table (PART 1 of the library pair) --------------------
+    data = ExportSAFETables(REACT_TABLE, hdrs, LoadCases:=resolvedCases, _
+                            Warning:=warn, Failed:=failed)
+    If Len(warn) > 0 Then LogMsg "WriteNodalReactions1: '" & REACT_TABLE & "' : " & warn
+
+    ' ---- 5. put the display load combinations back -------------------------
+    If clearedCombos Then
+        clearedCombos = False
+        On Error Resume Next
+        Err.Clear
+        If SelectedNameCount(savedCombos) > 0 Then
+            ret = gDB.SetLoadCombinationsSelectedForDisplay(savedCombos)
+        Else
+            ret = gDB.SetLoadCombinationsSelectedForDisplay(none)
+        End If
+        errNum = Err.Number
+        errDesc = Err.Description
+        On Error GoTo Fail
+
+        If errNum <> 0 Or ret <> 0 Then
+            Say "WriteNodalReactions1: the display load combinations could not be " & _
+                "put back the way they were - check the selection in SAFE's Show " & _
+                "Tables (" & errNum & " / code " & ret & ").", vbExclamation
+        End If
+    End If
+
+    If failed Then
+        MarkTableFailed REACT_SHEET, REACT_TOPLEFT, REACT_TABLE, warn
+        Say "WriteNodalReactions1: '" & REACT_TABLE & "' could not be read - " & _
+            warn & vbCrLf & vbCrLf & _
+            "The log names the reason, and LastErrorText() gives the last one." & _
+            vbCrLf & vbCrLf & _
+            "If SAFE reports the table key is unknown, run ListSAFETables (or " & _
+            "DemoListTables) to list the keys THIS model reports.", vbExclamation
+        Exit Sub
+    End If
+
+    ' ---- 6. PREPROCESS -----------------------------------------------------
+    ' A row is dropped when its Fz cell reads as a zero; a blank cell is not a
+    ' zero and is kept. The column is located BY NAME in the keys SAFE reported,
+    ' so its position in the table does not matter.
+    ixFz = TableColumnIndex(hdrs, "Fz")
+    If ixFz = 0 Then
+        Say "WriteNodalReactions1: '" & REACT_TABLE & "' reports no 'Fz' column, " & _
+            "so no row could be filtered and nothing was written." & vbCrLf & vbCrLf & _
+            "SAFE reports " & ItemCount(hdrs) & " column(s).", vbExclamation
+        Exit Sub
+    End If
+
+    nRows = 0
+    nCols = 0
+    On Error Resume Next
+    nRows = UBound(data, 1)
+    nCols = UBound(data, 2)
+    On Error GoTo Fail
+
+    nKept = 0
+    If nRows > 0 And nCols > 0 Then
+        ' which rows survive (1 = keep, 0 = drop)
+        ReDim keepRow(1 To nRows)
+        For r = 1 To nRows
+            fzText = SafeText(data(r, ixFz))
+            If Len(fzText) > 0 And Val(fzText) = 0 Then
+                keepRow(r) = 0
+            Else
+                keepRow(r) = 1
+                nKept = nKept + 1
+            End If
+        Next r
+
+        ' the survivors, as a block of exactly that many rows
+        If nKept > 0 Then
+            ReDim kept(1 To nKept, 1 To nCols)
+            k = 0
+            For r = 1 To nRows
+                If keepRow(r) = 1 Then
+                    k = k + 1
+                    For c = 1 To nCols
+                        kept(k, c) = data(r, c)
+                    Next c
+                End If
+            Next r
+        End If
+    End If
+
+    If nKept = 0 Then ReDim kept(1 To 0, 1 To 1)   ' a defined, empty block
+
+    LogMsg "WriteNodalReactions1: '" & REACT_TABLE & "' - " & nRows & " row(s) read, " & _
+           nKept & " kept (rows with Fz = 0 dropped), " & nCols & " column(s)."
+
+    ' ---- 7. write (PART 2 of the library pair) -----------------------------
+    printed = PrintTable(kept, REACT_SHEET, REACT_TOPLEFT, REACT_TABLE, hdrs, _
+                         WriteTitle:=False, WriteHeader:=False)
+
+    If printed < 0 Then
+        Say "WriteNodalReactions1: the table could not be written to '" & _
+            REACT_SHEET & "' - see the bold red marker on that sheet and the log.", _
+            vbExclamation
+    Else
+        LogMsg "WriteNodalReactions1: '" & REACT_TABLE & "' written to '" & _
+               REACT_SHEET & "'!" & REACT_TOPLEFT & " - " & printed & " data row(s) (" & _
+               GetLastExportFailures() & " failed block(s))."
+    End If
+    Exit Sub
+
+Fail:
+    ' Never leave SAFE carrying a display filter this sub changed.
+    reason = CStr(Err.Number) & " - " & Err.Description
+    On Error Resume Next
+    If clearedCombos Then
+        clearedCombos = False
+        If SelectedNameCount(savedCombos) > 0 Then
+            ret = gDB.SetLoadCombinationsSelectedForDisplay(savedCombos)
+        Else
+            ret = gDB.SetLoadCombinationsSelectedForDisplay(none)
+        End If
+    End If
+    Say "WriteNodalReactions1 stopped on an unexpected error: " & reason & vbCrLf & _
+        vbCrLf & "ShowLog has the full log.", vbExclamation
 End Sub
 
 ' ===========================================================================
