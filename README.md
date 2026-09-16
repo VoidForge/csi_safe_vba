@@ -1,9 +1,10 @@
 # CSI SAFE ↔ Excel VBA modules (`SAFE_Library.bas`, `SAFE_Use.bas`)
 
 A VBA library module to embed in Excel that **attaches to a running CSI SAFE
-instance** and writes one or more SAFE database tables into a worksheet at a
-tab + top-left coordinate you pass in as function parameters, plus an optional
-companion module of site-specific subs that call into it.
+instance**, **reads one table at a time into a 2-D array** so the data can be
+processed in VBA, and **prints that array to a worksheet** at a tab + top-left
+coordinate you pass in as function parameters — plus an optional companion module
+of site-specific subs that call into it.
 
 It is written against the COM API documented in
 `CSI_API_SAFE_v1_html/` (`SAFEv1.dll`, SAFE 20) and its behaviour is informed
@@ -34,35 +35,107 @@ workflow is replicated here).
 4. **Run** the macro `DemoExport` (`F5`), or call the functions yourself
    (see below).
 
-## Main function
+## Main functions — two halves, called in chain
+
+Reading from SAFE and writing to the sheet are separate now, so the data can be
+processed in VBA in between. `ExportSAFETables` returns the table as a 2-D array;
+`PrintTable` writes a 2-D array to a sheet. Existing callers are the two calls in
+chain.
+
+### PART 1 — `ExportSAFETables`: SAFE → 2-D array
 
 ```vba
-n = ExportSAFETables(Tables, SheetName, StartCell, StackHorizontally, IncludeHeader, LoadCases, LoadCombos)
+data = ExportSAFETables(TableKey, Headers, [LoadCases], [LoadCombos], [Warning], [Failed])
 ```
 
-- `Tables` — one key, a comma-separated list, or a `String()` array.
-- `SheetName` — destination worksheet; created if it does not exist.
-- `StartCell` — top-left coordinate, e.g. `"B3"`.
-- `StackHorizontally` — `False` = stack tables down (default); `True` = side by side.
-- `IncludeHeader` — write the table's **title row and** column-header row
-  (default `True`); `False` = data only, landing flush on `StartCell`.
-- `LoadCases` — optional; only these load CASES appear in result tables.
-- `LoadCombos` — optional; the same, for load COMBINATIONS.
-- Returns the number of tables written; `-1` on a fatal error.
+- `TableKey` — **one** table key, e.g. `"Element Forces - Area Shells"`.
+- `Headers()` — OUT: SAFE's column keys for the returned array, in SAFE's order
+  (0-based `String` array). The DATA array never carries a header row.
+- `LoadCases` — optional; only these load CASES appear in the returned rows of
+  result tables. One name, a comma-separated list, or a `String()` array;
+  empty = all of them.
+- `LoadCombos` — optional; the same, for load COMBINATIONS. SAFE keeps load cases
+  and load combinations as two separate display lists, so a case name belongs in
+  `LoadCases` and a combination name in `LoadCombos`.
+- `Warning` — OUT: the read-quirk text (e.g. `API code 1 (nonzero, but data was
+  still returned)`); empty when there is nothing to report.
+- `Failed` — OUT: `True` when the read could not be served.
+- Returns a 1-based 2-D `Variant` array `[row, col]` of DATA, or `Empty` when
+  nothing came back. **Branch on `Failed`, never on `Empty`** — an empty table is
+  a normal answer, a failed read is not. Nothing is written to the sheet here.
 
 ```vba
-' Single table, own sheet:
-ExportSAFETables "Element Forces - Area Shells", "Forces", "B2"
-
-' Several tables stacked on one sheet:
-ExportSAFETables Array("Point Object Connectivity", _
-                      "Area Load Assignments - Uniform"), _
-                 "SAFE Tables", "A1"
-
-' Only include specific load cases in result tables (e.g. just LIVE):
-ExportSAFETables "Element Forces - Area Shells", "Forces", "B2", LoadCases:="LIVE"
-' ...or a list: LoadCases:=Array("LIVE", "DEAD")
+' One table into an array — nothing lands on a sheet yet:
+Dim hdrs() As String, data As Variant
+data = ExportSAFETables("Element Forces - Area Shells", hdrs, LoadCases:="LIVE")
+' ...or a list: LoadCases:=Array("LIVE", "DEAD"), or LoadCombos:="1.4DL+1.6LL"
 ```
+
+### PART 2 — `PrintTable`: 2-D array → worksheet
+
+```vba
+rows = PrintTable(Data, SheetName, StartCell, [Title], [Headers], [WriteTitle], _
+                  [WriteHeader], [StackHorizontally], [NextRow], [NextCol])
+```
+
+- `Data` — a 1-based 2-D array. Normally the array PART 1 returned, but **any**
+  1-based 2-D array works (a `Range.Value` array included), so a computed or
+  reshaped block is printable.
+- `SheetName` / `StartCell` — destination worksheet (created if it does not exist)
+  and its top-left coordinate, e.g. `"B3"`.
+- `Title` — optional line above the block (normally the table key). It also names
+  the block in the log and in the FAILED markers.
+- `Headers` — optional `String()` array of column keys (normally `hdrs` from PART 1).
+- `WriteTitle` / `WriteHeader` — `False` with `False` writes **neither** the title
+  row nor the header row, so the DATA lands flush on `StartCell`.
+- `StackHorizontally` — which way `NextRow`/`NextCol` point for the next block:
+  `False` = downwards (default), `True` = to the right.
+- `NextRow` / `NextCol` — OUT: the cursor for the next block. That is how several
+  tables are stacked or placed side by side now that each call prints one table.
+- Returns the number of DATA rows written (`0` = an empty block — title and/or
+  header rows only, or a `no data returned` marker — and `-1` when the block could
+  not be written; see *Error handling*).
+
+```vba
+' The chain, in full:
+Dim hdrs() As String, data As Variant, warn As String, failed As Boolean
+
+data = ExportSAFETables("Element Forces - Area Shells", hdrs, , , warn, failed)
+If failed Then
+    MarkTableFailed "Forces", "B2", "Element Forces - Area Shells", warn
+Else
+    PrintTable data, "Forces", "B2", "Element Forces - Area Shells", hdrs
+End If
+```
+
+### Several tables on one sheet
+
+Each call writes one table, so a loop runs the chain and threads the cursor
+`NextRow`/`NextCol` back into the next `StartCell`:
+
+```vba
+Dim keys As Variant, i As Long, cell As String, nr As Long, nc As Long
+Dim hdrs() As String, data As Variant, warn As String, failed As Boolean
+
+keys = Array("Point Object Connectivity", "Area Load Assignments - Uniform")
+ResetExportFailures                 ' count failures for the whole batch
+cell = "A1"
+For i = LBound(keys) To UBound(keys)
+    data = ExportSAFETables(keys(i), hdrs, , , warn, failed)
+    If failed Then
+        MarkTableFailed "SAFE Tables", cell, keys(i), warn, , nr, nc
+    Else
+        PrintTable data, "SAFE Tables", cell, keys(i), hdrs, , , , nr, nc
+    End If
+    cell = ThisWorkbook.Worksheets("SAFE Tables").Cells(nr, nc).Address(False, False)
+Next i
+Debug.Print GetLastExportFailures() & " table(s) FAILED"
+```
+
+`DemoExport` in the library is this loop, `DemoProcessTable` shows the point of
+the split (find the largest value of one column with `TableColumnIndex`, then
+print the same array), and `DemoExportSingle` / `DemoExportFiltered` /
+`DemoExportFilteredCombo` are the chain in its shortest form.
 
 ### Other entry points
 
@@ -76,12 +149,30 @@ ExportSAFETables "Element Forces - Area Shells", "Forces", "B2", LoadCases:="LIV
   modules: reads an **editing** table into `Headers()` (column keys, in SAFE’s
   order) plus a 1-based 2-D array **without** the header row — exactly the form
   `WriteSAFETable` takes back. Read-only; it never touches the model’s lock.
+- `MarkTableFailed(SheetName, StartCell, TableKey, Reason, …)` — writes the bold
+  red `Table '<key>' : FAILED - <reason>` marker for a table whose **read** failed
+  (`ExportSAFETables`' `Failed` = `True`; pass its `Warning` as the reason), so the
+  sheet shows that the table was asked for and did not come back instead of an
+  empty gap. It returns the same `NextRow`/`NextCol` cursor as `PrintTable`, so the
+  two can be swapped inside one loop. (`PrintTable` writes its own marker when the
+  data *was* read but the worksheet could not hold the block.)
+- `TableColumnIndex(Headers, ColumnKey)` — 1-based index of a column key in a
+  `Headers()` array (`0` = the table does not report it), case- and
+  space-insensitive. The same number indexes the data array, so a column is found
+  **by name** instead of by position:
+  `col = TableColumnIndex(hdrs, "M11")` then `data(row, col)`.
+- `ResetExportFailures()` / `GetLastExportFailures()` — start and read the failure
+  count for a batch of chains (0 = none). Each failed read and each block the
+  worksheet could not hold counts once.
 - `SAFEConnect()` / `SAFEDisconnect()` — attach / release the running SAFE.
 - `ShowLog()` / `ClearLog()` / `GetLog()` / `LogMsg(msg)` — diagnostics; `LogMsg`
   is public so a companion module can write into the same log.
 - `gSAFE` / `gSapModel` / `gDB` / `gConnected` — public module state, for API
   calls this library does not wrap (always call `SAFEConnect()` first).
-- `DemoExport`, `DemoExportSingle`, `DemoListTables` — ready-made examples.
+- `DemoExport`, `DemoExportSingle`, `DemoExportFiltered`,
+  `DemoExportFilteredCombo`, `DemoProcessTable`, `DemoListTables` — ready-made
+  examples (the first five are the chain, in a loop / shortest form / with a
+  filter / with a calculation).
 
 ## Companion subs (`SAFE_Use.bas`)
 
@@ -130,8 +221,9 @@ runs the analysis or saves the model.
 n = ReadResultTableForCases(TableKey, LoadCases, SheetName, TopLeftCell, [IncludeHeader])
 ```
 
-A generic worker: it passes `TableKey`, the load cases and the destination to the
-library's `ExportSAFETables`, but **clears SAFE’s display load combinations first**
+A generic worker: it runs the two library halves in chain — `ExportSAFETables`
+with the requested load cases, then `PrintTable` (or `MarkTableFailed` when the
+read failed) — but **clears SAFE’s display load combinations first**
 (a single blank list = select none) and puts them back afterwards — on the normal
 path and on the error path — so a result table can never pick up combination rows by
 accident and the SAFE session is left as it was found.
@@ -145,11 +237,10 @@ those cases (blank entries ignored).
 
 **No title row, no header row — data only, by default.** `IncludeHeader` defaults to
 `False` and suppresses the **whole** block header: neither the table key (title) nor
-the column-header row is written, so the DATA lands **flush on `TopLeftCell`**, and
-the column keys are not even fetched from SAFE (`ExportSAFETables` passes its
-`IncludeHeader` down to `SAFETableToArray`'s `ReturnHeaders`, which itself defaults to
-`False`). Pass `IncludeHeader:=True` for the labelled block — table key on the first
-row, column keys on the second — which moves the first data row **two** rows down.
+the column-header row is written, so the DATA lands **flush on `TopLeftCell`**
+(`PrintTable` is called with `WriteTitle:=False` and `WriteHeader:=False`). Pass
+`IncludeHeader:=True` for the labelled block — table key on the first row, column
+keys on the second — which moves the first data row **two** rows down.
 
 `WriteNodalReactions1` is the ready example: its settings are **local constants
 inside the sub** — `REACT_SHEET` / `REACT_TOPLEFT` (**top-left corner only**; the data
@@ -159,7 +250,8 @@ down from there; a table too big for one sheet continues on `<sheet>_2`, `_3`, �
 and `REACT_TABLE` = `Joint Reactions`, verified against
 `reference/SAFE Input&Output Table Key List.csv` (Import Type 0 — a result table,
 so it can be read but never written back). A key that is wrong for the model writes
-nothing and marks the block bold red instead of exporting plausible-looking data.
+nothing and marks the block bold red (`MarkTableFailed`) instead of exporting
+plausible-looking data.
 
 ## Table keys
 
@@ -188,10 +280,16 @@ The script deliberately tolerates SAFE’s quirks instead of aborting:
 1. **Nonzero return.** `GetTableForDisplayArray` returns a nonzero code either
    when there is nothing to show *or* when the request cannot be served. The two
    are told apart by whether column headers came back: **nonzero with headers**
-   is a warning (logged, the data is still used); **nonzero without headers** is
-   a hard failure for that table — bold red `FAILED` marker, logged as an error,
-   counted by `GetLastExportFailures()` — and the export continues with the rest.
-2. **Empty tables.** Headers-only or empty tables never crash the writer.
+   is a warning (reported through the `Warning` out-argument and logged, the data
+   is still used); **nonzero without headers** is a hard failure for that read —
+   `Failed` comes back `True`, it is logged as an error, it counts by
+   `GetLastExportFailures()`, and `MarkTableFailed` leaves a bold red `FAILED`
+   marker in the sheet. The rest of a batch is unaffected.
+2. **Empty tables.** Headers-only or empty tables never crash the writer. A block
+   with nothing at all to write (no title, no header and no data row) gets a
+   `no data returned` marker instead of an empty gap; the warning text for a
+   nonzero-but-data-returned read is reported through `Warning` and the log
+   rather than written beside the marker.
 3. **Flattened data.** SAFE returns data as a *one-dimensional* array, row by
    row. Rows are rebuilt from the number of columns
    (`FieldsKeysIncluded`), with bounds guards in case the array is shorter
@@ -221,14 +319,14 @@ The script deliberately tolerates SAFE’s quirks instead of aborting:
    and each only affects *result* tables. Both selections are saved first and
    restored afterwards, on the normal exit and on the error path. Empty
    parameter = all of them. Quirk: a single blank string selects *no* cases.
-   A name SAFE does not accept is **fatal** (`-1`) rather than exporting
-   unfiltered force results.
-9. **Excel limits.** A table larger than one worksheet is continued on
-   `<SheetName>_2`, `_3`, … (title and header row repeated per sheet, when they are
-   being written) and a warning is logged; a table too wide for the sheet, or a
-   `StartCell` with no room left for the title/header rows (neither exists when
-   `IncludeHeader` is `False`), is **refused** and reported as a failed table
-   rather than truncated silently.
+   A name SAFE does not accept is **fatal** for that read (`Failed` = `True`,
+   `Empty` returned) rather than handing back unfiltered force results.
+9. **Excel limits (`PrintTable`).** A block larger than one worksheet is continued
+   on `<SheetName>_2`, `_3`, … (title and header row repeated per sheet, when they
+   are being written) and a warning is logged; a block too wide for the sheet, or a
+   `StartCell` with no room left for the title/header rows (neither row exists when
+   `WriteTitle` and `WriteHeader` are both `False`), is **refused** — bold red marker,
+   `-1` returned, counted as a failure — rather than truncated silently.
 
 All warnings go to the VBA **Immediate window** (`Ctrl+G`) and can be shown
 with `ShowLog()`.

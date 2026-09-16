@@ -23,88 +23,126 @@ Option Explicit
 '    1. Open SAFE, load your model, leave it running.
 '    2. In Excel: Alt+F11 -> Tools > References... -> add SAFEv1.tlb (once).
 '    3. Alt+F11 -> File > Import File... -> choose this .bas
-'    4. Run macro  DemoExport     (or call ExportSAFETables yourself).
+'    4. Run macro  DemoExport     (or chain ExportSAFETables + PrintTable
+'       yourself - see MAIN API below).
 '
-'  MAIN API
-'    ExportSAFETables(Tables, SheetName, StartCell, ...)
-'        Tables     : a single table key (String) OR an array of keys (String())
-'                     e.g. "Element Forces - Area Shells"
-'                     or   Array("Point Object Connectivity", "Area Load Assignments - Uniform")
-'                     or   "Table A, Table B"   (comma separated string)
-'        SheetName  : destination worksheet ("tab") - created if missing
-'        StartCell  : top-left cell, e.g. "B3"
-'        StackHorizontally : False = tables stacked downwards (default),
-'                            True  = tables placed side by side
-'        IncludeHeader     : write the table's title row AND its column-header
-'                            row (default True). False = DATA ONLY: neither the
-'                            title nor the header row is written, so the data
-'                            block starts ON StartCell, and the column keys are
-'                            not even fetched from SAFE
-'        LoadCases   (new) : optional load-CASE filter - only these load cases
-'                            appear in result tables. Accepts one name, a
-'                            comma-separated list, or a String() array.
-'                            Empty / default = export ALL load cases.
-'        LoadCombos  (new) : optional load-COMBINATION filter - same formats as
-'                            LoadCases, but for combinations, e.g.
-'                            "1.4DL+1.6LL" or "1.4(D+WH)" (the pile-cap sheet
-'                            filters its results by COMBINATION, so this is
-'                            the one it needs). SAFE keeps load cases and load
-'                            combinations as two SEPARATE display lists, so a
-'                            combination name belongs in LoadCombos and a case
-'                            name in LoadCases - neither list accepts the
-'                            other's names. Empty / default = ALL combinations.
+'  MAIN API - TWO PARTS, CALLED IN CHAIN
+'    ExportSAFETables(TableKey, Headers, [LoadCases], [LoadCombos], [Warning],
+'                     [Failed])
+'        PART 1 OF 2 - reads ONE table out of SAFE and hands it back as a 2-D
+'        array. NOTHING is written to the workbook here, so the data can be
+'        processed in VBA first (maxima, filtering, comparisons ...); it is then
+'        written with PrintTable, or simply used as it is.
+'        TableKey   : the exact table key, e.g. "Element Forces - Area Shells"
+'        Headers()  : OUT - SAFE's column keys for the returned array, in SAFE's
+'                     order (0-based). The DATA array never carries a header row.
+'        LoadCases  : optional load-CASE filter - only these load cases
+'                     appear in the returned rows of result tables. Accepts one
+'                     name, a comma-separated list, or a String() array.
+'                     Empty / default = read ALL load cases.
+'        LoadCombos : optional load-COMBINATION filter - same formats as
+'                     LoadCases, but for combinations, e.g. "1.4DL+1.6LL"
+'                     or "1.4(D+WH)". SAFE keeps load cases and load
+'                     combinations as two SEPARATE display lists, so a
+'                     combination name belongs in LoadCombos and a case
+'                     name in LoadCases - neither list accepts the
+'                     other's names. Empty / default = ALL combinations.
 '        FILTERS    : SAFE's display filter only selects what the RESULT tables
 '                     show - non-result tables are unaffected.
 '                     In a name list, blank entries and exact duplicates are
 '                     ignored; everything else is sent to SAFE unchanged
 '                     (SAFE matches names exactly, so casing is preserved).
-'                     The selection in force BEFORE the export is saved first
-'                     and put back afterwards, on the normal exit AND on the
-'                     error path, so your SAFE session is never left filtered
-'                     (a previously empty selection is restored as "none
-'                     selected", the documented way to select nothing).
-'                     An unknown / mis-spelled name is FATAL (-1): the export
-'                     stops rather than quietly returning UNFILTERED force
-'                     results. The log names the rejected names and the exact
-'                     return code.
-'        Returns    : number of tables written; -1 on a fatal error
-'                     (see Immediate window / ShowLog for details)
-'        FAILURES   : a table is marked FAILED - and is NOT counted in the
-'                     number written - when its read cannot be served: a
-'                     NONZERO code from GetTableForDisplayArray with NO column
-'                     headers returned (the table key is not valid for this
-'                     model / SAFE version, or the table is a result table
-'                     whose analysis has not been run), or a COM error. A
-'                     failed table writes a bold-red cell at the current
-'                     cursor: "Table '<key>' : FAILED - <reason>", is logged
-'                     as an ERROR, and does NOT stop the export - the
-'                     remaining tables are still written. This is deliberately
-'                     different from a valid key with no rows (an EMPTY table),
-'                     which writes the plain "no data returned" marker.
-'                     GetLastExportFailures() reports how many tables failed in
-'                     the last run - a failed READ and a block the worksheet
-'                     could not hold (a WRITE failure) are both counted.
-'        LIMITS     : the data is written into ordinary worksheet cells, so
-'                     EXCEL'S OWN LIMITS apply - and they are READ AT RUNTIME
-'                     from the sheet (ws.Rows.Count / ws.Columns.Count), never
-'                     hardcoded, because they depend on the file format
-'                     (1,048,576 rows x 16,384 columns for .xlsx/.xlsm,
-'                     65,536 x 256 for .xls). A table that does not fit on one
-'                     worksheet is CONTINUED automatically on the sheets
-'                     <SheetName>_2, <SheetName>_3, ... (the name of the sheet
-'                     the table starts on, so a second spilled table nests off
-'                     the sheet it starts on) with the title and the
-'                     column-header row (whichever of the two is being written)
-'                     REPEATED on every sheet, so each sheet is self-contained
-'                     and can be read on its own; a WARNING
-'                     is logged before the first continuation sheet, and the
-'                     cursor returned to you moves to the sheet it ends on.
-'                     NOTHING is ever truncated silently: a table WIDER than
-'                     the sheet, or a StartCell so low that not even the title
-'                     and header row fit, is refused with an ERROR in the log, a
-'                     BOLD RED FAILED marker at the cursor, and is counted by
-'                     GetLastExportFailures() - the same treatment a failed READ
-'                     gets, and it is not counted as a table that was written.
+'                     The selection in force BEFORE the read is saved first and
+'                     put back afterwards, on the normal exit AND on the error
+'                     path, so your SAFE session is never left filtered (a
+'                     previously empty selection is restored as "none selected",
+'                     the documented way to select nothing). One call reads one
+'                     table, so a filtered batch applies and removes the filter
+'                     once per table - the rows that come back are the same.
+'                     An unknown / mis-spelled name is FATAL: the read stops
+'                     (Failed = True, Empty returned) rather than quietly
+'                     handing back UNFILTERED force results. The log names the
+'                     rejected names and the exact return code.
+'        Warning    : OUT - the read quirk text, e.g. "API code 1 (nonzero, but
+'                     data was still returned)"; empty when there is nothing to
+'                     report. Pass it on to MarkTableFailed when the read failed.
+'        Failed     : OUT - True when the read could not be served (see FAILURES
+'                     below); the returned array is then Empty.
+'        Returns    : a 1-based 2-D Variant array [row, col] holding the DATA
+'                     only, or Empty when nothing came back - Failed = True, or a
+'                     valid key whose table has no rows. The column count is
+'                     UBound(data, 2), the same as the length of Headers().
+'                     Callers must BRANCH ON Failed, never on Empty: an EMPTY
+'                     table is a normal answer, a FAILED read is not.
+'        FAILURES   : a read FAILS when it cannot be served - a NONZERO code
+'                     from GetTableForDisplayArray with NO column headers
+'                     returned (invalid key for this model / SAFE version, or a
+'                     result table whose analysis has not been run), or a COM
+'                     error. A failed read sets Failed = True, logs an ERROR,
+'                     counts once in GetLastExportFailures(), and returns Empty.
+'                     A valid key with no rows is an EMPTY table, not a failure:
+'                     Failed = False and Empty data.
+'
+'    PrintTable(Data, SheetName, StartCell, [Title], [Headers], [WriteTitle],
+'               [WriteHeader], [StackHorizontally], [NextRow], [NextCol])
+'        PART 2 OF 2 - writes ONE 2-D array to a worksheet. The array is normally
+'        the one ExportSAFETables returned, but ANY 1-based 2-D array works (a
+'        Range.Value array included), so a computed or reshaped block is
+'        printable too.
+'        Data              : 1-based 2-D array [row, col], no header row.
+'        SheetName         : destination worksheet ("tab") - created if missing
+'        StartCell         : top-left cell, e.g. "B3"
+'        Title             : optional line written above the block (normally the
+'                            table key). It also names the block in the log and
+'                            in the FAILED markers.
+'        Headers           : optional String() array of column keys - normally the
+'                            Headers() that came out of ExportSAFETables.
+'        WriteTitle        : write the Title row (default True).
+'        WriteHeader       : write the column-header row (default True); it is
+'                            skipped when no Headers were supplied.
+'                            WriteTitle:=False with WriteHeader:=False = DATA
+'                            ONLY: neither row is written, so the data block
+'                            starts exactly ON StartCell.
+'        StackHorizontally : which way the returned cursor points for the NEXT
+'                            block - False = downwards (default), True = right.
+'        NextRow/NextCol   : OUT - where the next block goes. Each call writes one
+'                            table, so this cursor is how several tables are
+'                            stacked or placed side by side.
+'        Returns           : the number of DATA rows written - summed over every
+'                            worksheet used - or -1 when the block could not be
+'                            written in full. 0 is a valid EMPTY block (title
+'                            and/or header rows only, when they are written).
+'        LIMITS            : the data goes into ordinary worksheet cells, so
+'                            EXCEL'S OWN LIMITS apply. They are read AT RUNTIME
+'                            from the sheet (1,048,576 x 16,384 for .xlsx/.xlsm,
+'                            65,536 x 256 for .xls). A block that does not fit on
+'                            one worksheet is CONTINUED on <SheetName>_2,
+'                            <SheetName>_3, ... with the title and the
+'                            column-header row (whichever is being written)
+'                            REPEATED on every sheet, so each sheet can be read
+'                            on its own; a WARNING is logged before the first
+'                            continuation sheet. Nothing is truncated silently: a
+'                            block WIDER than the sheet, or a StartCell with no
+'                            room for the title/header rows, is refused with an
+'                            ERROR, a BOLD RED marker and a failure count.
+'
+'    MarkTableFailed(SheetName, StartCell, TableKey, Reason, [StackHorizontally],
+'                    [NextRow], [NextCol])
+'        Writes the bold-red "Table '<key>' : FAILED - <reason>" marker for a
+'        table whose READ failed (ExportSAFETables' Failed = True - pass its
+'        Warning as Reason), so the sheet shows that the table was asked for and
+'        did not come back instead of an empty gap. Same cursor rules and same
+'        failure count as a failed write. PrintTable writes its own marker when
+'        the data WAS read but the worksheet could not hold it.
+'
+'    Typical chain:
+'        Dim hdrs() As String, data As Variant
+'        data = ExportSAFETables("Joint Reactions", hdrs)
+'        PrintTable data, "Sheet1", "B3", "Joint Reactions", hdrs
+'
+'    Reshaping a table before printing works because the two halves are
+'    independent: take the array, compute (maxima, envelope, filtered rows ...)
+'    into a new 2-D array, and PrintTable that instead.
 '
 '    ListSAFETables(SheetName, StartCell)   : dumps EVERY table SAFE reports
 '                                             (key | name | import type) - the
@@ -134,9 +172,17 @@ Option Explicit
 '    LastErrorNumber() / LastErrorDescription() / LastErrorContext() /
 '    LastErrorText()                        : the last error that was recorded
 '                                             by LogError / SetLastError (below)
-'    GetLastExportFailures()                : how many tables FAILED (bold red
-'                                             markers) in the most recent
-'                                             ExportSAFETables call - 0 = none.
+'    TableColumnIndex(Headers, ColumnKey)   : 1-based index of a column key in a
+'                                             Headers() array (0 = the table does
+'                                             not report it); the same number
+'                                             indexes the data array, so a
+'                                             column is found BY NAME instead of
+'                                             by position
+'    ResetExportFailures() / GetLastExportFailures()
+'                                           : start / read the failure count for a
+'                                             batch of ExportSAFETables +
+'                                             PrintTable chains (each failure is
+'                                             a bold red FAILED marker).
 '                                             ClearLog / GetLog / ShowLog give
 '                                             the full log text.
 '
@@ -147,20 +193,14 @@ Option Explicit
 '
 '  QUIRKS LEARNED (from the reference Python script + SAFE API docs)
 '    - SAFE's COM main object is called "ETABSObject" (ETABS infrastructure).
-'    - GetTableForDisplayArray: "nonzero means error OR nothing to show" -
-'      the two are distinguished by whether column headers were returned.
+'    - GetTableForDisplayArray: a nonzero return means an error OR "nothing to
+'      show" - the two are told apart by whether column headers came back.
 '      Nonzero WITH headers is only a WARNING (data still came back / the table
-'      is empty), and the export keeps going. Nonzero with NO headers at all is
-'      a HARD FAILURE: CSI documents "if there is nothing to be shown in the
-'      table then no data is returned", so a valid key would still have
-'      reported its columns - the key is invalid for this model / SAFE
-'      version, or analysis has not been run. That table is marked in BOLD RED
-'      in the sheet, logged as an error, excluded from the function's count and
-'      reported by GetLastExportFailures(), but the export still continues with
-'      the remaining tables. A ZERO return with headers but no records is the
-'      genuinely EMPTY table (plain "no data returned" marker). The reference
-'      Python script treats ANY nonzero return as fatal; this module only does
-'      that for the no-headers case, so one bad key cannot cost the whole run.
+'      is empty). Nonzero with NO headers is a HARD FAILURE: CSI documents "if
+'      there is nothing to be shown in the table then no data is returned", so
+'      a valid key would still have reported its columns - the key is invalid
+'      for this model / SAFE version, or analysis has not been run. A ZERO
+'      return with headers but no records is a genuinely EMPTY table.
 '    - FieldKeyList must be a single blank string to get ALL columns.
 '    - GroupName "" (or "All") returns data for all objects in the model.
 '    - The data array is FLATTENED row-by-row; rows are rebuilt using the
@@ -171,58 +211,45 @@ Option Explicit
 '    - Editing tables requires the model UNLOCKED - but only for the tables
 '      SAFE reports as interactively importable while the model is unlocked
 '      (GetAllTables ImportType = 2). WriteSAFETable preflights that import
-'      type BEFORE it touches the lock, unlocks only when the preflight says it
-'      must (or, for a table it could not preflight, when the UnlockModel
-'      argument says so), and RESTORES the lock state it found on the success
-'      path AND on every failure path - a write-back can never leave the model
-'      unlocked. ImportType 3 is importable while locked or unlocked, so no
-'      unlock is needed; 0 (not importable) and 1 (not INTERACTIVELY importable)
-'      cannot be written back through the editing-table pair at all and are
-'      refused without touching the lock.
+'      type BEFORE touching the lock, unlocks only when the preflight says it
+'      must (or, for a table it could not preflight, when UnlockModel says so),
+'      and restores the lock state it found on every exit path. ImportType 3
+'      is importable while locked or unlocked, so no unlock is needed; 0 (not
+'      importable) and 1 (not INTERACTIVELY importable) cannot be written back
+'      through the editing-table pair at all and are refused without touching
+'      the lock.
 '    - Applying an edit makes any existing analysis results STALE: re-run the
-'      analysis in SAFE afterwards. This module deliberately never runs the
-'      analysis (and never saves the model) for you.
+'      analysis in SAFE afterwards. This module never runs the analysis and
+'      never saves the model.
 '    - SetTableForEditingArray's TableVersion is a RETURNED (out) item, not an
 '      input - the docs say "Returned Item: The version number of the specified
-'      table", and the reference implementation passes 0 for it (and ignores
-'      what comes back). Never feed the version read by GetTableForEditingArray
-'      back in: pass 0 and capture the returned value; a mismatch is only
-'      logged as information, never treated as a failure.
+'      table". Never feed the version read by GetTableForEditingArray back in:
+'      pass 0 and capture the returned value; a mismatch is only logged as
+'      information.
 '    - ApplyEditedTables can corrupt the model on a fatal error - SAFE docs
-'      recommend saving the model BEFORE calling it. We check the error counts:
-'      a FAILURE is a nonzero return OR NumFatalErrors > 0. Error / warning /
-'      info messages on their own are NOT a failure - they are logged as a
-'      warning and the edit is still treated as applied.
+'      recommend saving the model BEFORE calling it. The error counts are
+'      checked: a FAILURE is a nonzero return OR NumFatalErrors > 0. Error /
+'      warning / info messages on their own are NOT a failure - they are logged
+'      as a warning and the edit is still treated as applied.
 '    - ApplyEditedTables' FillImportLog argument MUST be passed as True to get a
 '      non-empty ImportLog: with False the counts still come back but the log
-'      string is always empty (which is why a failure used to be reported with
-'      no text). SAFE warns that the log MAY BE VERY LARGE, so this module
-'      copies only the first IMPORT_LOG_MAX characters into its own log, with
-'      a " ... [truncated]" marker; the full text stays available in SAFE.
+'      string is always empty. SAFE warns that the log MAY BE VERY LARGE, so
+'      this module copies only the first IMPORT_LOG_MAX characters into its own
+'      log, with a " ... [truncated]" marker; the full text stays in SAFE.
 '    - EXCEL LIMITS / SHEET SPILL: a table larger than one worksheet is written
-'      across <SheetName>, <SheetName>_2, <SheetName>_3, ... (the sheets are
-'      created on demand by GetWorksheet; "SheetName" is the sheet the table
-'      STARTS on, so a second spilled table nests off the sheet it starts on and
-'      cannot reuse a sheet that already carries rows). Excel's 31-character
-'      sheet-name limit is respected by cutting the BASE name short and keeping
-'      the "_N" suffix intact - truncating the whole combination could collapse
-'      the name back onto a sheet that already holds rows. Every sheet
+'      across <SheetName>, <SheetName>_2, <SheetName>_3, ... ("SheetName" is
+'      the sheet the table STARTS on, so a second spilled table nests off that
+'      sheet). Excel's 31-character sheet-name limit is respected by cutting
+'      the BASE name short and keeping the "_N" suffix intact. Every sheet
 '      repeats the title and the header row (when they are being written), so a
-'      sheet can be read on its own.
-'      A WARNING is logged before the first continuation sheet ("<n> data rows
-'      exceed the <limit>-row worksheet limit - continuing on additional
-'      worksheets"), one line per continuation sheet, and the total number of
-'      rows written when a spill happened. The limits are read AT RUNTIME from
-'      the sheet itself (CurSheet.Rows.Count / CurSheet.Columns.Count) because
-'      they differ between .xlsx/.xlsm (1,048,576 x 16,384) and .xls
-'      (65,536 x 256). The ordinary case is untouched: it is still ONE bulk
-'      Range.Value2 write of the whole array. Slicing (building a fresh 1-based
-'      2-D Variant chunk, row by row) happens ONLY in the spill path, so a
-'      normal export loses no speed. A table that is WIDER than the worksheet,
-'      and a StartCell with no room left for the title + header rows, are
-'      REFUSED (ERROR in the log + a bold red FAILED marker + reported as a
-'      FAILED table by GetLastExportFailures, never as 0 rows written) rather
-'      than truncated or allowed to raise a run-time error.
+'      sheet can be read on its own. The limits are read AT RUNTIME from the
+'      sheet (CurSheet.Rows.Count / CurSheet.Columns.Count), because they
+'      differ between .xlsx/.xlsm (1,048,576 x 16,384) and .xls (65,536 x 256).
+'      A WARNING is logged before the first continuation sheet. The ordinary
+'      case is still ONE bulk Range.Value2 write; slicing happens only in the
+'      spill path. A table WIDER than the worksheet, and a StartCell with no
+'      room left for the title + header rows, are REFUSED (ERROR + bold red
+'      FAILED marker + counted by GetLastExportFailures) rather than truncated.
 '    - When attaching to a running instance, NEVER call ApplicationExit
 '      (it would close the user's SAFE session).
 '    - CONNECTION ERRORS (Readme.txt troubleshooting): a "438 or 5" failure
@@ -230,11 +257,10 @@ Option Explicit
 '      is busy analysing / is not locked. Every trappable error is recorded
 '      with its number AND its 8-digit HRESULT by LogError, and can be read
 '      back with LastErrorNumber / LastErrorDescription / LastErrorContext.
-'    - SAFEConnect() PROVES the link is live before reporting success, by
+'    - SAFEConnect() proves the link is live before reporting success, by
 '      calling SapModel.GetModelFilepath() - a cheap read-only call. A stale
 '      Running Object Table entry (SAFE closed or crashed after connecting)
-'      survives the GetObject attach and only fails on first use, so without
-'      the probe a dead proxy could be cached as "connected".
+'      survives the GetObject attach and only fails on first use.
 ' ============================================================================
 
 ' ---------------------------------------------------------------------------
@@ -248,16 +274,10 @@ Private Const SAFE_PROGID As String = "CSI.SAFE.API.ETABSObject"
 Private Const SAFE_HELPER_PROGID As String = "CSI.SAFE.API.Helper"
 
 ' ---------------------------------------------------------------------------
-' [COMMENTED OUT - HARDCODED IMPORT SECTION]
-' The SAFE type-library reference is now read from the Excel VBA IDE setting
+' The SAFE type-library reference is read from the Excel VBA IDE setting
 ' (Alt+F11 -> Tools > References... -> add SAFEv1.tlb), so no file path is
-' hardcoded here any more. The old hardcoded paths are kept below for
-' reference only.
+' hardcoded here.
 ' ---------------------------------------------------------------------------
-'Private Const SAFE_TLB_PATH As String = _
-'    "C:\Program Files\Computers and Structures\SAFE 20\SAFEv1.tlb"
-'Private Const SAFE_DLL_PATH As String = _
-'    "C:\Program Files\Computers and Structures\SAFE 20\SAFEv1.dll"
 
 ' Default destination used by the Demo macros.
 Private Const DEF_SHEET As String = "SAFE Tables"
@@ -272,29 +292,22 @@ Private Const IMPORT_LOG_MAX As Long = 2000
 ' ---------------------------------------------------------------------------
 ' Module state (connection + log + display filter)
 ' ---------------------------------------------------------------------------
-' The connection objects below are deliberately PUBLIC so that companion modules
-' of site-specific subs (e.g. SAFE_Use.bas) can use the live SAFE
-' objects directly - for API calls this library does not wrap, or to read a table
-' it does not read - WITHOUT a second attach to SAFE and without a wrapper
-' function for every call. VBA module scope gives no real protection here anyway:
-' anything in the project can already obtain the same objects through GetObject
-' or New Helper.
+' The connection objects below are PUBLIC so that companion modules of
+' site-specific subs (e.g. SAFE_Use.bas) can use the live SAFE objects directly,
+' without a second attach to SAFE and without a wrapper function for every call.
 ' Keep the "g" prefix when referencing them from another module (gSAFE /
-' gSapModel / gDB / gConnected) so it stays obvious which module owns them and
-' that they are only meaningful while gConnected is True - and always call
-' SAFEConnect() first, which is idempotent.
+' gSapModel / gDB / gConnected). They are only meaningful while gConnected is
+' True - always call SAFEConnect() first, which is idempotent.
 Public gSAFE As cOAPI            ' SAFE API object
 Public gSapModel As cSapModel    ' model object
 Public gDB As cDatabaseTables    ' database tables (cached)
 Public gConnected As Boolean     ' True between SAFEConnect and SAFEDisconnect
 Private gLog As String
 
-' Number of tables that FAILED in the most recent ExportSAFETables run (a
-' nonzero read code with NO column headers, or a COM error - see Fix 4 in
-' SAFETableToArray). Reset to 0 at the start of every run, incremented once per
-' failed table, and read back with GetLastExportFailures(). Failed tables are
-' marked in bold red in the destination sheet and are NOT part of the count
-' ExportSAFETables returns.
+' Number of FAILED tables since the last ResetExportFailures() (0 = none). A
+' read that cannot be served (ExportSAFETables) and a block the worksheet could
+' not hold (PrintTable) each count once, and each writes its own bold red marker
+' in the destination sheet. Read back with GetLastExportFailures().
 Private mFailedTables As Long
 
 ' Display-filter state (the load cases / load combinations selected for table
@@ -327,9 +340,8 @@ Public Function SAFEConnect() As Boolean
 
     ' Strategy 1: attach to the running instance through the Running Object
     ' Table (VBA's GetObject with an empty path). The error NUMBER is recorded
-    ' rather than discarded: "no active instance" is expected here, but shares
-    ' its error numbers (429 / 0x800401E3) with genuine failures, so it has to
-    ' be visible in the log.
+    ' because "no active instance" shares its error numbers (429 / 0x800401E3)
+    ' with genuine failures, so it has to be visible in the log.
     On Error Resume Next
     Err.Clear
     Set gSAFE = GetObject(, SAFE_PROGID)
@@ -424,81 +436,78 @@ Public Sub SAFEDisconnect()
 End Sub
 
 ' ===========================================================================
-' MAIN FUNCTION - extract one or more tables and write them to Excel
+' PART 1 OF 2 - READ one table out of SAFE as a 2-D array
 ' ===========================================================================
+' Nothing is written to the workbook here. The array that comes back is the same
+' data the worksheet used to receive, so it can be processed in VBA first
+' (maxima, filtering, comparisons ...) and then written with PrintTable below.
+' The LoadCases / LoadCombos display filters are the SAFE side of the job and
+' therefore live here; the worksheet side lives in PrintTable.
 
 Public Function ExportSAFETables( _
-    ByVal Tables As Variant, _
-    ByVal SheetName As String, _
-    ByVal StartCell As String, _
-    Optional ByVal StackHorizontally As Boolean = False, _
-    Optional ByVal IncludeHeader As Boolean = True, _
+    ByVal TableKey As String, _
+    ByRef Headers() As String, _
     Optional ByVal LoadCases As Variant = "", _
-    Optional ByVal LoadCombos As Variant = "") As Long
-    ' Returns the number of tables written, or -1 on a fatal error.
+    Optional ByVal LoadCombos As Variant = "", _
+    Optional ByRef Warning As String = "", _
+    Optional ByRef Failed As Boolean = False) As Variant
+    ' Returns a 1-based 2-D Variant array [row, col] of DATA (no header row), or
+    ' Empty when nothing came back: Failed = True (the read could not be served),
+    ' or a valid key whose table has no rows. Branch on Failed, never on Empty -
+    ' an EMPTY table is a normal answer.
+    ' Headers()  : OUT - SAFE's column keys in SAFE's order (0-based). The data
+    '              array's column count is UBound(data, 2), the same as
+    '              ArrLenStr(Headers).
+    ' Warning    : OUT - the read quirk text ("API code 1 (nonzero, but data was
+    '              still returned)"); empty when there is nothing to report.
+    ' Failed     : OUT - True when the read could not be served. Counted once by
+    '              GetLastExportFailures(); pass Warning to MarkTableFailed so the
+    '              sheet shows the failure too.
     ' LoadCases / LoadCombos: optional display filters - only these load CASES
-    ' and load COMBINATIONS appear in result tables ("" / missing = export all
-    ' of them; non-result tables are unaffected by SAFE's display filter).
-    ' A name SAFE does not recognise is fatal: the export stops with -1 instead
-    ' of silently writing unfiltered force results. Whatever filter is applied
-    ' here is removed again on every exit path (RestoreDisplayFilterState).
+    ' and load COMBINATIONS appear in the returned rows of result tables
+    ' ("" / missing = read all of them; non-result tables are unaffected by
+    ' SAFE's display filter). A name SAFE does not recognise is fatal: the read
+    ' stops (Failed = True, Empty returned) instead of quietly handing back
+    ' unfiltered force results. Whatever filter is applied here is removed again
+    ' on every exit path (RestoreDisplayFilterState).
 
-    Dim savedScreen As Boolean
-    savedScreen = Application.ScreenUpdating
-    Application.ScreenUpdating = False
-    On Error GoTo Fatal
-
-    ' reset the failure counter HERE - before the first way out of
-    ' this function. It used to be reset much further down, i.e. AFTER the "no
-    ' table names" return, the invalid-StartCell return and a failed SAFEConnect,
-    ' so those exits left GetLastExportFailures() reporting the PREVIOUS run's
-    ' count. (The identical prologue in ListSAFETables deliberately does NOT
-    ' touch it: listing tables is not an export run.)
-    mFailedTables = 0
-
-    If Not gConnected Then
-        If Not SAFEConnect() Then
-            Application.ScreenUpdating = savedScreen
-            ExportSAFETables = -1
-            Exit Function
-        End If
-    End If
-
-    Dim names() As String
-    Dim nTables As Long
-    nTables = NormalizeTables(Tables, names)
-    If nTables <= 0 Then
-        LogMsg "ExportSAFETables: no table names were supplied."
-        Application.ScreenUpdating = savedScreen
-        ExportSAFETables = 0
-        Exit Function
-    End If
-
-    Dim ws As Worksheet
-    Set ws = GetWorksheet(ThisWorkbook, SheetName)
-
-    Dim r As Long, c As Long
-    If Not ParseStartCell(ws, StartCell, r, c) Then
-        LogMsg "ExportSAFETables: invalid StartCell '" & StartCell & "'."
-        Application.ScreenUpdating = savedScreen
-        ExportSAFETables = -1
-        Exit Function
-    End If
-
-    Dim i As Long
-    Dim written As Long
-    written = 0
-    Dim hdrs() As String
+    Dim key As String
+    Dim rawNames() As String
+    Dim nRaw As Long
+    Dim caseNames() As String
+    Dim nCases As Long
+    Dim comboNames() As String
+    Dim nCombos As Long
     Dim warn As String
     Dim tblFailed As Boolean
     Dim data As Variant
-    ' FIX 7: 'ws' is handed to WriteTableBlock ByRef and comes back pointing at
-    ' the sheet the cursor ended up on (a table too large for one worksheet is
-    ' continued on <SheetName>_2, _3, ...). Every marker below is therefore
-    ' written through 'ws', and 'markerSheet' remembers where the LAST failure
-    ' marker went, so the end-of-run message cannot name a continuation sheet
-    ' that holds no marker just because a later table spilled onto it.
-    Dim markerSheet As String
+    Dim errNum As Long, errDesc As String
+
+    Erase Headers
+    Warning = ""
+    Failed = False
+    ExportSAFETables = Empty
+
+    ' Clear any leftover error first, so a COM failure below belongs to THIS read.
+    Err.Clear
+
+    key = Trim$(TableKey)
+    If Len(key) = 0 Then
+        LogMsg "ExportSAFETables: no table key was supplied."
+        Failed = True
+        Warning = "no table key was supplied"
+        Exit Function
+    End If
+
+    On Error GoTo Fatal
+
+    If Not gConnected Then
+        If Not SAFEConnect() Then
+            Failed = True
+            Warning = "could not attach to a running SAFE instance"
+            Exit Function
+        End If
+    End If
 
     ' --- optional load-case / load-combination display filter --------------
     ' The names are cleaned (trimmed, blank entries and exact duplicates
@@ -507,13 +516,6 @@ Public Function ExportSAFETables( _
     ' right now is saved before any setter runs, so RestoreDisplayFilterState can
     ' put it back on every exit path. A name SAFE does not recognise makes its
     ' setter fail, which is treated as fatal (see ApplyDisplayFilterState).
-    Dim rawNames() As String
-    Dim nRaw As Long
-    Dim caseNames() As String
-    Dim nCases As Long
-    Dim comboNames() As String
-    Dim nCombos As Long
-
     nRaw = NormalizeTables(LoadCases, rawNames)
     nCases = CleanNameList(rawNames, nRaw, caseNames)
     nRaw = NormalizeTables(LoadCombos, rawNames)
@@ -522,149 +524,309 @@ Public Function ExportSAFETables( _
     If nCases > 0 Or nCombos > 0 Then
         SaveDisplayFilterState
         If Not ApplyDisplayFilterState(caseNames, nCases, comboNames, nCombos) Then
-            ' Fatal: the Fatal handler removes any filter that was already applied.
-            GoTo Fatal
+            ' Fatal: an unknown name must never come back as unfiltered results.
+            RestoreDisplayFilterState
+            Failed = True
+            Warning = "SAFE did not accept the load-case / load-combination " & _
+                      "name(s) - the log names the rejected entry."
+            Exit Function
         End If
     End If
 
-    For i = 0 To nTables - 1
-        Dim key As String
-        key = Trim(names(i))
-        If Len(key) > 0 Then
-            ' Clear any leftover error first, so the Err object can tell THIS
-            ' table's COM failure apart from an earlier one in the same run.
-            Err.Clear
-            tblFailed = False
-            ' ReturnHeaders follows IncludeHeader: with IncludeHeader = False the
-            ' caller wants a bare data block, so the column keys are not fetched
-            ' either. The normal-case test below still works without them, because
-            ' a table that has rows has a non-empty data array, and WriteTableBlock
-            ' takes its column count from that array.
-            data = SAFETableToArray(key, hdrs, warn, tblFailed, ReturnHeaders:=IncludeHeader)
-
-            If Not tblFailed And Len(warn) > 0 Then
-                ' Not a failure: the API code was nonzero but data still came
-                ' back, or the table genuinely has no rows. Log and carry on.
-                LogMsg "[" & key & "] " & warn
-            End If
-
-            If tblFailed Then
-                ' HARD FAILURE - deliberately NOT the empty-table path. A nonzero
-                ' read code came back with NO column headers, so the request
-                ' could not be served: the key is not valid for this model / SAFE
-                ' version, or the table is a result table whose analysis has not
-                ' been run. Counted separately, logged as an ERROR, marked
-                ' unmistakably in the sheet, and the export CONTINUES with the
-                ' next table (the failed table is not counted as written).
-                mFailedTables = mFailedTables + 1
-
-                ' LogError records a genuine COM failure with its number and
-                ' 8-digit HRESULT. An API-level failure has no Err number at all,
-                ' so SetLastError records the table key and the warning text
-                ' (LogError would silently do nothing in that case).
-                If Err.Number <> 0 Then
-                    LogError "ExportSAFETables", "Table '" & key & "' : " & warn
-                Else
-                    ' API-level failure (no error number): the 438 / "check the
-                    ' SAFEv1 reference" hint would point at the WRONG cause here,
-                    ' so this call supplies its own hint (see SetLastError).
-                    SetLastError "ExportSAFETables", "Table '" & key & "' : " & warn, _
-                                 "Hint: run ListSAFETables (or DemoListTables) for the " & _
-                                 "exact table keys of THIS model, and check that the " & _
-                                 "analysis has been run for result tables."
-                End If
-
-                With ws.Cells(r, c)
-                    .Value = "Table '" & key & "' : FAILED - " & warn
-                    .Font.Bold = True
-                    .Font.Color = vbRed
-                End With
-                markerSheet = ws.Name   ' for the summary message at the end
-                r = r + 2              ' same cursor advance as the empty path
-            ElseIf ArrLenStr(hdrs) > 0 Or Not IsEmpty(data) Then
-                ' Normal case: write the block - title row and header row first
-                ' when IncludeHeader asks for them (it is handed to WriteTableBlock
-                ' twice, as WithTitle and as WithHeader), then the data.
-                ' IncludeHeader:=False therefore suppresses BOTH, and the data
-                ' block starts on the start cell.
-                ' FIX 7: 'ws' is passed ByRef as the block's starting sheet and
-                ' is updated to the sheet the cursor ends up on, so everything
-                ' written after this point stays on the right sheet when the
-                ' table was too large for one worksheet and was continued on
-                ' <SheetName>_2, _3, ... The base name handed over is the name of
-                ' the sheet the cursor is on NOW, so a second spilled table -
-                ' which starts on the last sheet the first one used - derives its
-                ' own continuation names from that sheet and can never reuse a
-                ' sheet that already carries rows.
-                ' DEFECT 2 FIX: a NEGATIVE return means the block could NOT be
-                ' written in full - it is too wide for a worksheet, there is no
-                ' room left for its title/header rows, or a continuation sheet ran
-                ' out of room part-way through the spill. WriteTableBlock has
-                ' already written a BOLD RED marker at the cursor and stepped past
-                ' it, so this branch must NOT write a second marker: it counts the
-                ' table as FAILED, records the sheet the marker went to, and logs
-                ' it - exactly like a failed read (Fix 4). A return of 0 is NOT a
-                ' failure - that is a valid empty table (title + header only, when
-                ' they are being written).
-                If WriteTableBlock(ThisWorkbook, ws, ws.Name, r, c, key, hdrs, data, _
-                                   IncludeHeader, IncludeHeader, _
-                                   StackHorizontally, r, c) < 0 Then
-                    mFailedTables = mFailedTables + 1
-                    SetLastError "ExportSAFETables", "Table '" & key & "' : the data " & _
-                        "was read from SAFE but could NOT be written to the sheet - " & _
-                        "see the bold red marker on sheet '" & ws.Name & "' and the " & _
-                        "ERROR lines logged above.", _
-                        "Hint: start the block closer to A1 (or on a sheet with more " & _
-                        "room) so that the block and all of the table's columns " & _
-                        "fit on the worksheet - with IncludeHeader:=False there is " & _
-                        "no title row and no header row, so only the data has to fit."
-                    markerSheet = ws.Name
-                Else
-                    written = written + 1
-                End If
-            Else
-                ' Valid key, genuinely empty table - a visibly different marker,
-                ' so an EMPTY table and a FAILED table cannot be confused.
-                ' Written through the sheet the cursor is on now (unchanged from
-                ' the starting sheet unless a previous table spilled).
-                ws.Cells(r, c).Value = "Table '" & key & "' : no data returned"
-                If Len(warn) > 0 Then ws.Cells(r, c + 1).Value = warn
-                r = r + 2
-            End If
-        End If
-    Next i
+    ' The column keys are always returned: PrintTable decides whether to write
+    ' them (WriteHeader), and a caller processing the data needs them to map a
+    ' column by name.
+    data = SAFETableToArray(key, Headers, warn, tblFailed, ReturnHeaders:=True)
 
     ' Put the display selection back exactly as it was found. The restore is
-    ' idempotent and the Fatal path calls it too, so a failed export cannot
-    ' leave the user's SAFE session with a changed display filter.
+    ' idempotent and the Fatal path calls it too, so a failed read cannot leave
+    ' the user's SAFE session with a changed display filter.
     RestoreDisplayFilterState
 
-    ' The run finished, but some tables did NOT: say so explicitly, name the
-    ' sheet carrying the red markers, and point at the way to get valid keys.
-    ' (Failed tables are not part of the returned count.)
-    If mFailedTables > 0 Then
-        ' 'markerSheet' - not 'ws', which may since have moved to a continuation
-        ' sheet because a later table was too large for one worksheet.
-        LogMsg "WARNING: ExportSAFETables: " & written & " table(s) written and " & _
-               mFailedTables & " table(s) FAILED (marked in BOLD RED on sheet '" & _
-               markerSheet & "'). A FAILED READ - a nonzero read code with no " & _
-               "column headers - means the table key is not valid for this model " & _
-               "/ SAFE version, or the table is a result table whose analysis has " & _
-               "not been run (run ListSAFETables / DemoListTables for the valid " & _
-               "keys). The same red marker names a WRITE failure when the data WAS " & _
-               "read but the worksheet could not hold the whole block. " & _
-               "See GetLastExportFailures()."
+    If tblFailed Then
+        ' HARD FAILURE: a nonzero read code came back with NO column headers, so
+        ' the request could not be served (invalid key for this model / SAFE
+        ' version, or a result table whose analysis has not been run).
+        mFailedTables = mFailedTables + 1
+        Failed = True
+        Warning = warn
+
+        ' LogError only records a genuine COM failure; an API-level failure has
+        ' no Err number at all, so SetLastError records the table key and the
+        ' warning text instead.
+        If Err.Number <> 0 Then
+            LogError "ExportSAFETables", "Table '" & key & "' : " & warn
+        Else
+            SetLastError "ExportSAFETables", "Table '" & key & "' : " & warn, _
+                         "Hint: run ListSAFETables (or DemoListTables) for the " & _
+                         "exact table keys of THIS model, and check that the " & _
+                         "analysis has been run for result tables."
+        End If
+        Exit Function
     End If
 
-    Application.ScreenUpdating = savedScreen
-    ExportSAFETables = written
+    If Len(warn) > 0 Then
+        ' Not a failure: the API code was nonzero but data still came back, or
+        ' the table genuinely has no rows.
+        LogMsg "[" & key & "] " & warn
+    End If
+
+    If IsEmpty(data) Then
+        LogMsg "ExportSAFETables: '" & key & "' returned no data row (" & _
+               ArrLenStr(Headers) & " column(s) reported)."
+    Else
+        LogMsg "ExportSAFETables: '" & key & "' read into a 2-D array - " & _
+               ArrRows(data) & " row(s) x " & ArrCols(data) & " column(s)."
+    End If
+
+    ExportSAFETables = data
     Exit Function
 
 Fatal:
+    ' Capture the error details in LOCALS first: LogError uses the live Err object
+    ' and ErrorText can call Error$(), which would overwrite it before the report.
+    errNum = Err.Number
+    errDesc = Err.Description
     RestoreDisplayFilterState
+    LogError "ExportSAFETables", "Table '" & TableKey & "'"
+    Failed = True
+    Warning = "an unexpected error stopped the read - " & ErrorText(errNum, errDesc)
+    ExportSAFETables = Empty
+End Function
+
+' ===========================================================================
+' PART 2 OF 2 - WRITE one 2-D array to a worksheet
+' ===========================================================================
+
+Public Function PrintTable( _
+    ByVal Data As Variant, _
+    ByVal SheetName As String, _
+    ByVal StartCell As String, _
+    Optional ByVal Title As String = "", _
+    Optional ByRef Headers As Variant, _
+    Optional ByVal WriteTitle As Boolean = True, _
+    Optional ByVal WriteHeader As Boolean = True, _
+    Optional ByVal StackHorizontally As Boolean = False, _
+    Optional ByRef NextRow As Long = 0, _
+    Optional ByRef NextCol As Long = 0) As Long
+    ' Writes ONE 2-D array at (StartCell) on (SheetName), with an optional title
+    ' row (Title) and an optional column-header row (Headers), and hands back the
+    ' cursor (NextRow / NextCol) for the block that goes after it. Any 1-based
+    ' 2-D array works, so a computed or reshaped block can be printed, not only
+    ' the array ExportSAFETables returned.
+    ' Returns the number of DATA rows written - summed over every worksheet when
+    ' the block had to be continued on <SheetName>_2, _3, ... - or -1 when the
+    ' block could NOT be written (wider than the sheet, no room for the
+    ' title/header rows, or a continuation sheet that ran out of room). 0 is a
+    ' valid EMPTY block: title and/or header rows only. A -1 also counts once in
+    ' GetLastExportFailures() and has already written its own bold red marker.
+    ' WriteTitle:=False together with WriteHeader:=False writes neither row, so
+    ' the DATA lands flush on StartCell. A block that would leave the sheet
+    ' untouched - no title, no header and no data row - writes the
+    ' "no data returned" marker instead of leaving a gap.
+
+    Dim savedScreen As Boolean
+    Dim ws As Worksheet
+    Dim r As Long, c As Long
+    Dim hdr() As String
+    Dim nHdr As Long
+    Dim rowsWritten As Long
+    Dim blockName As String
+    Dim j As Long
+
+    savedScreen = Application.ScreenUpdating
+    Application.ScreenUpdating = False
+    On Error GoTo Fatal
+
+    NextRow = 0
+    NextCol = 0
+    PrintTable = -1
+    If Len(Title) > 0 Then blockName = Title Else blockName = "(untitled block)"
+
+    Set ws = GetWorksheet(ThisWorkbook, SheetName)
+
+    If Not ParseStartCell(ws, StartCell, r, c) Then
+        LogMsg "PrintTable: invalid StartCell '" & StartCell & "' on sheet '" & _
+               SheetName & "' - nothing was written."
+        SetLastError "PrintTable", "the StartCell '" & StartCell & "' could not be " & _
+            "resolved against sheet '" & SheetName & "'."
+        Application.ScreenUpdating = savedScreen
+        Exit Function
+    End If
+
+    ' Column keys are optional, and are copied into a local String() array because
+    ' that is the shape the block writer takes. No keys = no header row.
+    nHdr = 0
+    If Not IsMissing(Headers) Then
+        If IsArray(Headers) Then
+            On Error Resume Next
+            nHdr = UBound(Headers) - LBound(Headers) + 1
+            On Error GoTo Fatal
+            If nHdr > 0 Then
+                ReDim hdr(0 To nHdr - 1)
+                For j = 0 To nHdr - 1
+                    hdr(j) = CStr(Headers(LBound(Headers) + j))
+                Next j
+            End If
+        End If
+    End If
+
+    ' A block with no title row, no header row and no data rows would leave the
+    ' sheet untouched, so an empty result is marked instead of leaving a gap.
+    Dim nothingToWrite As Boolean
+    nothingToWrite = (ArrRows(Data) = 0)
+    If WriteTitle And Len(Title) > 0 Then nothingToWrite = False
+    If WriteHeader And ArrLenStr(hdr) > 0 Then nothingToWrite = False
+
+    If nothingToWrite Then
+        ' Nothing at all would be written: a marker - not a silently empty cell -
+        ' is what an empty result should look like.
+        If Len(Title) > 0 Then
+            ws.Cells(r, c).Value = "Table '" & Title & "' : no data returned"
+        Else
+            ws.Cells(r, c).Value = "No data returned"
+        End If
+        LogMsg "PrintTable: '" & blockName & "' had no title, no header and no data " & _
+               "row to write, so the 'no data returned' marker was written to " & _
+               "sheet '" & ws.Name & "' at " & StartCell & "."
+        If StackHorizontally Then
+            NextRow = r
+            NextCol = c + 1
+        Else
+            NextRow = r + 2
+            NextCol = c
+        End If
+        PrintTable = 0
+    Else
+        ' Normal path: the title row and the header row (each one only when its
+        ' switch asks for it), then the data. 'ws' is passed ByRef and comes back
+        ' as the sheet the cursor ended up on, so NextRow / NextCol refer to the
+        ' sheet a spilled block finished on.
+        rowsWritten = WriteTableBlock(ThisWorkbook, ws, ws.Name, r, c, Title, hdr, _
+                                      Data, WriteTitle, WriteHeader, _
+                                      StackHorizontally, NextRow, NextCol)
+        If rowsWritten < 0 Then
+            ' WriteTableBlock has already written the bold red marker and stepped
+            ' past it, so nothing more is written here.
+            mFailedTables = mFailedTables + 1
+            SetLastError "PrintTable", "the block '" & blockName & "' could NOT be " & _
+                "written to sheet '" & ws.Name & "' - see the bold red marker on that " & _
+                "sheet and the ERROR lines logged above.", _
+                "Hint: start the block closer to A1 (or on a sheet with more room) so " & _
+                "that the block and all of its columns fit on the worksheet - with " & _
+                "WriteTitle:=False and WriteHeader:=False only the data has to fit."
+        Else
+            LogMsg "PrintTable: '" & blockName & "' written to sheet '" & ws.Name & _
+                   "' at " & StartCell & " - " & rowsWritten & " data row(s) x " & _
+                   ArrCols(Data) & " column(s); next block at row " & NextRow & _
+                   ", column " & NextCol & "."
+        End If
+        PrintTable = rowsWritten
+    End If
+
     Application.ScreenUpdating = savedScreen
-    LogError "ExportSAFETables"
-    ExportSAFETables = -1
+    Exit Function
+
+Fatal:
+    Application.ScreenUpdating = savedScreen
+    LogError "PrintTable", "writing '" & blockName & "' to sheet '" & SheetName & "'"
+    PrintTable = -1
+End Function
+
+' ===========================================================================
+' FAILED-READ MARKER - the red cell a failed read leaves behind
+' ===========================================================================
+
+Public Sub MarkTableFailed( _
+    ByVal SheetName As String, _
+    ByVal StartCell As String, _
+    ByVal TableKey As String, _
+    ByVal Reason As String, _
+    Optional ByVal StackHorizontally As Boolean = False, _
+    Optional ByRef NextRow As Long = 0, _
+    Optional ByRef NextCol As Long = 0)
+    ' Writes the bold red "Table '<key>' : FAILED - <reason>" marker for a read
+    ' that could not be served - ExportSAFETables' Failed = True, with its Warning
+    ' passed as Reason. This is the READ-side counterpart of the marker PrintTable
+    ' writes for itself when the data WAS read but the worksheet could not hold
+    ' it. NextRow / NextCol come back with the cursor for the next block exactly
+    ' as PrintTable returns it, so the two can be swapped inside one loop.
+
+    Dim savedScreen As Boolean
+    Dim ws As Worksheet
+    Dim r As Long, c As Long
+
+    savedScreen = Application.ScreenUpdating
+    Application.ScreenUpdating = False
+    On Error GoTo Fatal
+
+    NextRow = 0
+    NextCol = 0
+
+    Set ws = GetWorksheet(ThisWorkbook, SheetName)
+
+    If Not ParseStartCell(ws, StartCell, r, c) Then
+        LogMsg "MarkTableFailed: invalid StartCell '" & StartCell & "' on sheet '" & _
+               SheetName & "' - the FAILED marker for '" & TableKey & "' was not written."
+        Application.ScreenUpdating = savedScreen
+        Exit Sub
+    End If
+
+    With ws.Cells(r, c)
+        .Value = "Table '" & TableKey & "' : FAILED - " & Reason
+        .Font.Bold = True
+        .Font.Color = vbRed
+    End With
+
+    If StackHorizontally Then
+        NextRow = r
+        NextCol = c + 1
+    Else
+        NextRow = r + 2
+        NextCol = c
+    End If
+
+    LogMsg "MarkTableFailed: FAILED marker for '" & TableKey & "' written to sheet '" & _
+           ws.Name & "' at " & StartCell & " - " & Reason
+    Application.ScreenUpdating = savedScreen
+    Exit Sub
+
+Fatal:
+    Application.ScreenUpdating = savedScreen
+    LogError "MarkTableFailed", "writing the FAILED marker for '" & TableKey & "'"
+End Sub
+
+' ===========================================================================
+' DATA-PROCESSING HELPER - find a column in the returned Headers() array
+' ===========================================================================
+
+Public Function TableColumnIndex( _
+    ByRef Headers() As String, _
+    ByVal ColumnKey As String) As Long
+    ' 1-based index of ColumnKey inside a Headers() array, or 0 when the table
+    ' does not report that column. The comparison is case- and space-insensitive
+    ' (SAFE can pad a key with spaces).
+    ' The DATA array uses the SAME 1-based column numbering, so the index is used
+    ' on it directly:
+    '     col = TableColumnIndex(hdrs, "M11")
+    '     If col > 0 Then value = data(row, col)
+    ' Looking the column up by NAME is what keeps a calculation working when SAFE
+    ' reorders or renames a column - a hardcoded position does not.
+
+    Dim i As Long, n As Long
+    Dim probe As String
+
+    probe = Replace(UCase$(Trim$(ColumnKey)), " ", "")
+    If Len(probe) = 0 Then Exit Function
+
+    n = ArrLenStr(Headers)
+    For i = 0 To n - 1
+        If Replace(UCase$(Trim$(Headers(i))), " ", "") = probe Then
+            TableColumnIndex = i + 1              ' 1-based, for data(row, col)
+            Exit Function
+        End If
+    Next i
+    TableColumnIndex = 0
 End Function
 
 ' ===========================================================================
@@ -676,8 +838,8 @@ End Function
 ' the same, and telling them apart is exactly what this listing is for - so the
 ' log also records BOTH counts side by side. The sheet holds the GetAllTables
 ' list. GetAllTables additionally returns an IsEmpty flag per table ("True means
-' there is no data in the model to fill the table"); it is deliberately NOT
-' written to the sheet here, so an empty table still appears in full.
+' there is no data in the model to fill the table"); it is not written to the
+' sheet here, so an empty table still appears in full.
 
 Public Function ListSAFETables( _
     Optional ByVal SheetName As String = DEF_SHEET, _
@@ -791,10 +953,10 @@ End Function
 ' ===========================================================================
 ' EDITING-TABLE READ - PUBLIC bridge for companion modules
 ' ===========================================================================
-' The display reader (SAFETableToArray, above) is private and shaped for
-' EXPORTING: headers plus an array to write into a sheet. An EDIT needs the other
-' shape - every column of the table, in SAFE's order, ready to hand back to
-' SetTableForEditingArray - which is what this function returns.
+' The display reader (SAFETableToArray) is shaped for EXPORTING: headers plus
+' an array to write into a sheet. An EDIT needs the other shape - every column of
+' the table, in SAFE's order, ready to hand back to SetTableForEditingArray -
+' which is what this function returns.
 '
 ' Contract
 '   TableKey : a table SAFE reports as interactively editable, e.g.
@@ -849,8 +1011,8 @@ Public Function SAFEReadEditingTable( _
             TableKey, GroupName, TableVersion, FieldsKeysIncluded, NumberRecords, TableData)
 
     If ret <> 0 Then
-        ' Unlike the DISPLAY read there is no documented "nonzero but here is the
-        ' data anyway" case for the editing read, so a nonzero code is a failure.
+        ' Unlike the DISPLAY read there is no "nonzero but here is the data
+        ' anyway" case for the editing read, so a nonzero code is a failure.
         extra = ""
         If ArrLenStr(FieldsKeysIncluded) > 0 Then
             extra = " (it did report " & ArrLenStr(FieldsKeysIncluded) & " column(s))"
@@ -936,20 +1098,18 @@ Public Function WriteSAFETable( _
     '            corrupt the model on a fatal error).
     ' LOCKING    : the model is unlocked ONLY when SAFE reports this table as
     '              interactively importable while the model is unlocked
-    '              (GetAllTables ImportType = 2). ImportType = 3 needs no
-    '              unlock at all, and ImportType 0 / 1 cannot be written back
-    '              through the editing-table pair - those are refused BEFORE the
-    '              lock is touched. Whatever lock state was in force when the
-    '              call started is RESTORED on the way out, on the success path
-    '              and on every failure path, so your SAFE session is left
-    '              exactly as it was found.
-    '              UnlockModel is now only a FALLBACK, used when the table's
-    '              import type cannot be preflighted (the key is not in SAFE's
-    '              table list, or that list could not be read): True = unlock
-    '              the model anyway, False = leave the model alone.
+    '              (GetAllTables ImportType = 2). ImportType 3 needs no unlock,
+    '              and ImportType 0 / 1 cannot be written back through the
+    '              editing-table pair - those are refused BEFORE the lock is
+    '              touched. Whatever lock state was in force when the call
+    '              started is RESTORED on the way out, on every exit path.
+    '              UnlockModel is only a FALLBACK, used when the table's import
+    '              type cannot be preflighted (the key is not in SAFE's table
+    '              list, or that list could not be read): True = unlock the model
+    '              anyway, False = leave the model alone.
     ' EDITING    : an applied edit makes any existing analysis results STALE.
-    '              Re-run the analysis in SAFE afterwards - this module
-    '              deliberately does NOT run the analysis (or save) for you.
+    '              Re-run the analysis in SAFE afterwards - this module never
+    '              runs the analysis (or saves) for you.
 
     On Error GoTo Fail
 
@@ -958,9 +1118,9 @@ Public Function WriteSAFETable( _
     End If
 
     ' -----------------------------------------------------------------------
-    ' FIX 5 - LOCK HANDLING. Preflight the table's importability BEFORE the
-    ' model's lock state is touched, so a table that cannot be written back is
-    ' rejected without changing anything at all in the user's SAFE session.
+    ' LOCK HANDLING. Preflight the table's importability BEFORE the model's lock
+    ' state is touched, so a table that cannot be written back is rejected
+    ' without changing anything in the user's SAFE session.
     ' cDatabaseTables.GetAllTables reports an ImportType per table:
     '   0 = not importable
     '   1 = importable but NOT interactively importable
@@ -1115,7 +1275,7 @@ Public Function WriteSAFETable( _
     ' Capture the lock state ONCE (this is only a read - it changes nothing). If
     ' it cannot be read we ASSUME the model is locked, which is SAFE's normal
     ' state while its API is in use (see the Readme troubleshooting note), so a
-    ' model this call unlocks is always put back the way it was.
+    ' model this call unlocks is always put back.
     wasLocked = True
     On Error Resume Next
     Err.Clear
@@ -1195,10 +1355,8 @@ Public Function WriteSAFETable( _
     nRows = UBound(Data, 1)
     dataCols = UBound(Data, 2)
     ' Restore the Fail handler, NOT "On Error GoTo 0": the lock-restore block
-    ' at the bottom of this function is only reachable through "Fail:", and a
-    ' model this call unlocked must be put back even when one of the SAFE calls
-    ' below raises. Disabling trapping here would let a raised error leave the
-    ' user's model UNLOCKED.
+    ' at the bottom is only reachable through "Fail:", and a model this call
+    ' unlocked must be put back even when one of the SAFE calls below raises.
     On Error GoTo Fail
     If nRows < 1 Then nRows = 0
 
@@ -1246,9 +1404,9 @@ Public Function WriteSAFETable( _
     ' Apply all edited tables. Check the error counts - a nonzero return or
     ' fatal errors can leave the model in a bad state.
     ' QUIRK: FillImportLog must be True for ImportLog to be filled at all - with
-    ' False the counts still come back but the log string is EMPTY, which is why
-    ' a failure used to be reported with no detail. SAFE warns the log may be
-    ' very large, so only the first IMPORT_LOG_MAX characters are logged here.
+    ' False the counts still come back but the log string is EMPTY. SAFE warns
+    ' the log may be very large, so only the first IMPORT_LOG_MAX characters are
+    ' logged here.
     Dim NumFatalErrors As Long, NumErrorMsgs As Long
     Dim NumWarnMsgs As Long, NumInfoMsgs As Long
     Dim ImportLog As String
@@ -1301,14 +1459,13 @@ Fail:
 
 RestoreLock:
     ' -----------------------------------------------------------------------
-    ' FIX 5 - put the model's lock state back the way this call found it. This
-    ' is the ONLY place the restore happens, and it is reached from the SUCCESS
-    ' path AND from every failure path (the Fail label above falls into it), so
-    ' the module can never leave the user's SAFE session unlocked because of a
-    ' write-back. Clearing the flag as the block runs makes it idempotent (at
-    ' most one restore per call), and the SetModelIsLocked call is wrapped in a
-    ' minimal On Error Resume Next / On Error GoTo 0 pair so a failure to
-    ' re-lock is reported but can never mask the error that brought us here.
+    ' Put the model's lock state back the way this call found it. This is the
+    ' ONLY place the restore happens, and it is reached from the SUCCESS path AND
+    ' from every failure path (the Fail label above falls into it). Clearing the
+    ' flag as the block runs makes it idempotent (at most one restore per call),
+    ' and the SetModelIsLocked call is wrapped in a minimal On Error Resume Next
+    ' / On Error GoTo 0 pair so a failure to re-lock is reported but can never
+    ' mask the error that brought us here.
     ' -----------------------------------------------------------------------
     If unlockedByUs Then
         unlockedByUs = False            ' idempotent: at most one restore per call
@@ -1334,12 +1491,10 @@ RestoreLock:
 End Function
 
 ' Copy SAFE's ImportLog (ApplyEditedTables) into this module's log. Shared by the
-' failure path and the warning path so both report the same evidence; the counts
-' line is always written just BEFORE this is called, which is what the "counted
-' above" wording refers to. SAFE documents the log as possibly very large, so
-' only the first IMPORT_LOG_MAX characters are copied, with an explicit marker;
-' NumMsgs > 0 with an empty log means FillImportLog was not honoured (see the
-' quirk notes), which is worth saying out loud rather than losing the detail.
+' failure path and the warning path so both report the same evidence. SAFE
+' documents the log as possibly very large, so only the first IMPORT_LOG_MAX
+' characters are copied, with an explicit marker; NumMsgs > 0 with an empty log
+' means FillImportLog was not honoured.
 Private Sub LogImportLog(ByVal ImportLog As String, ByVal NumMsgs As Long)
     If Len(ImportLog) > 0 Then
         ' Truncate: the import log may be very large by design.
@@ -1376,12 +1531,12 @@ Public Function SAFETableToArray( _
     ' question as "did SAFE report any columns" - that one is answered internally
     ' from FieldsKeysIncluded and still decides failure vs empty below:
     '   False (DEFAULT): Headers() is left EMPTY. Use this when the caller does
-    '       not intend to write column headers at all (a header-less export); the
+    '       not intend to write column headers at all (a header-less block); the
     '       data array still carries EVERY column, so a writer can take the column
-    '       count from UBound(Data, 2) instead.
+    '       count from UBound(Data, 2) instead. ExportSAFETables always asks for
+    '       them (ReturnHeaders:=True), because a caller that processes the data
+    '       maps a column by name through the returned keys.
     '   True : Headers() is filled with SAFE's column keys, in SAFE's order.
-    ' ExportSAFETables passes its own IncludeHeader through here, so the library
-    ' behaves exactly as it always has when headers are wanted.
     '
     ' STATUS CONTRACT - Failed is False only for the non-failure cases, and the
     ' caller MUST branch on it (a failed read is never an empty table):
@@ -1424,12 +1579,12 @@ Public Function SAFETableToArray( _
             TableKey, FieldKeyList, GroupName, TableVersion, _
             FieldsKeysIncluded, NumberRecords, TableData)
 
-    ' QUIRK / FIX 4: a nonzero return means an error OR "nothing to show" -
-    ' the two are told apart by whether the COLUMN HEADERS came back. A table
-    ' that exists always reports its columns, so "nonzero AND no headers"
-    ' cannot be an empty table: it is a failed request (invalid key for this
-    ' model / SAFE version, or analysis not run). Nonzero WITH headers is only
-    ' a warning - the data was still returned.
+    ' QUIRK: a nonzero return means an error OR "nothing to show" - the two are
+    ' told apart by whether the COLUMN HEADERS came back. A table that exists
+    ' always reports its columns, so "nonzero AND no headers" cannot be an empty
+    ' table: it is a failed request (invalid key for this model / SAFE version,
+    ' or analysis not run). Nonzero WITH headers is only a warning - the data was
+    ' still returned.
     Dim nCols As Long
     nCols = ArrLenStr(FieldsKeysIncluded)
 
@@ -1541,16 +1696,14 @@ Public Function WriteTableBlock( _
     '                 GetWorksheet) - normally ThisWorkbook.
     ' CurSheet      : the sheet to START on. It is updated (ByRef) to the sheet
     '                 the cursor ENDS UP on, so the CALLER must write anything
-    '                 that follows (the empty-table marker, the red FAILED
-    '                 marker, the next table) through THIS variable: that is the
-    '                 starting sheet unless the table spilled, in which case
-    '                 writing through a reference captured before the call would
-    '                 put the marker on the wrong sheet.
+    '                 that follows (markers, the next table) through THIS
+    '                 variable - otherwise a spilled table's marker lands on the
+    '                 wrong sheet.
     ' BaseSheetName : the caller's sheet name - the name the continuation sheets
     '                 are derived from (see the spill note below).
     ' WithTitle     : write the title row (the table key) as the block's first
-    '                 row. ExportSAFETables drives this AND WithHeader from its
-    '                 single IncludeHeader switch, so IncludeHeader:=False puts
+    '                 row. PrintTable drives this AND WithHeader from its
+    '                 WriteTitle / WriteHeader switches, so both of them False put
     '                 the DATA flush on (r0, c0): no title row, no header row.
     ' WithHeader    : write the column-header row below the title. Needs the
     '                 caller to have filled Headers() (SAFETableToArray's
@@ -1562,21 +1715,19 @@ Public Function WriteTableBlock( _
     '   Columns.Count) and never hardcoded, because they depend on the workbook
     '   format: 1,048,576 x 16,384 for .xlsx/.xlsm, 65,536 x 256 for .xls.
     '     * a table that FITS is written with ONE bulk Range.Value2 write of the
-    '       whole Data array, exactly as before (no slicing at all in this path -
-    '       that is what keeps a normal export fast);
+    '       whole Data array;
     '     * a table that does NOT fit is continued on additional worksheets named
     '       <BaseSheetName>_2, <BaseSheetName>_3, ... created on demand by
     '       GetWorksheet. Excel allows at most 31 characters in a sheet name, so
     '       the base name is cut short when needed and the "_N" suffix is kept
     '       intact (truncating the whole combination could collapse the name back
     '       onto the base sheet and overwrite rows already written there). Every
-    '       sheet - the first one included - carries the title AND the header
-    '       row (whichever of the two is being written), so each sheet is
-    '       self-contained; each sheet's rows are sliced
-    '       into a fresh 1-based 2-D Variant chunk and bulk-written, so no row is
-    '       skipped or duplicated. ONE warning is logged before the first
-    '       continuation sheet, each continuation sheet is logged as it is used,
-    '       and the total rows written is logged when the spill finishes.
+    '       sheet carries the title AND the header row (whichever of the two is
+    '       being written), so each sheet is self-contained, and each sheet's rows
+    '       are sliced into a fresh 1-based 2-D Variant chunk and bulk-written.
+    '       ONE warning is logged before the first continuation sheet, each
+    '       continuation sheet is logged as it is used, and the total rows
+    '       written is logged when the spill finishes.
     '   Two situations are REFUSED instead of being truncated silently - an ERROR
     '   is logged, a bold red marker cell is written at the cursor, the cursor is
     '   stepped past the marker, and -1 is returned (so the caller reports the
@@ -1584,16 +1735,16 @@ Public Function WriteTableBlock( _
     '     * the table is WIDER than the sheet (c0 + nCols - 1 > Columns.Count);
     '     * the start cell leaves no room for the title + header rows, i.e. the
     '       capacity is < 1 (capacity = Rows.Count - (r0 - 1) - overhead rows).
-    '   Cursor bookkeeping keeps its original meaning, but refers to the sheet
-    '   the cursor lands on: Horiz = True -> NextCol = c0 + nCols + 1 and
-    '   NextRow = r0; Horiz = False -> NextRow = the row after the last written
-    '   row, plus one blank row, and NextCol = c0.
+    '   Cursor bookkeeping refers to the sheet the cursor lands on: Horiz = True
+    '   -> NextCol = c0 + nCols + 1 and NextRow = r0; Horiz = False ->
+    '   NextRow = the row after the last written row, plus one blank row, and
+    '   NextCol = c0.
 
     Dim nCols As Long
     nCols = ArrLenStr(Headers)
     ' Headers are OPTIONAL (SAFETableToArray's ReturnHeaders, driven by
-    ' ExportSAFETables' IncludeHeader): a caller that wants no header row does not
-    ' fetch them. The column count still has to come from somewhere, or the block
+    ' PrintTable's WriteHeader): a caller that wants no header row does not fetch
+    ' them. The column count still has to come from somewhere, or the block
     ' would be treated as zero-width and NOTHING would be written - so fall back to
     ' the width of the data array itself.
     If nCols <= 0 And Not IsEmpty(Data) Then
@@ -1619,8 +1770,9 @@ Public Function WriteTableBlock( _
 
     ' Rows of "overhead" the block needs above the data on EVERY sheet it uses:
     ' the title row, plus the header row, each one only when it is being written.
-    ' Both are 0 when the caller asked for a bare data block (IncludeHeader:=
-    ' False), so the whole sheet below (r0 - 1) is available for data.
+    ' Both are 0 when the caller asked for a bare data block (WriteTitle and
+    ' WriteHeader both False), so the whole sheet below (r0 - 1) is available for
+    ' data.
     Dim overheadRows As Long
     overheadRows = 0
     If WithTitle And Len(Title) > 0 Then overheadRows = overheadRows + 1
@@ -1657,10 +1809,8 @@ Public Function WriteTableBlock( _
             NextRow = r0 + 2
             NextCol = c0
         End If
-        ' DEFECT 2 FIX: -1, not 0. 0 means "wrote no rows" (a legitimate empty
-        ' table) and the caller counts such a block as WRITTEN; -1 is the failure
-        ' signal that makes the caller count this block with the failed tables
-        ' instead of reporting it as a table it wrote.
+        ' -1 is the failure signal, never 0: 0 means "wrote no rows" (a
+        ' legitimate empty table) and the caller counts such a block as WRITTEN.
         WriteTableBlock = -1
         Exit Function
     End If
@@ -1685,15 +1835,14 @@ Public Function WriteTableBlock( _
             NextRow = r0 + 2
             NextCol = c0
         End If
-        ' DEFECT 2 FIX: -1 (failure), not 0 ("wrote no rows") - see the width
-        ' check above.
+        ' -1 (failure), not 0 ("wrote no rows") - see the width check above.
         WriteTableBlock = -1
         Exit Function
     End If
 
     ' --- NORMAL CASE: the whole table fits on this sheet ---------------------
-    ' ONE bulk write of the entire Data array - unchanged from before the spill
-    ' support, so an ordinary export loses no speed (no row-by-row copying here).
+    ' ONE bulk write of the entire Data array - the normal export does no
+    ' row-by-row copying.
     If nRows <= capacity Then
         ' Title row - skipped when WithTitle is False, which is how a caller
         ' asking for a bare data block gets the data ON the start cell.
@@ -1734,16 +1883,10 @@ Public Function WriteTableBlock( _
     End If
 
     ' --- SPILL: the table does not fit on one worksheet ----------------------
-    ' A zero-width data block cannot be sliced row by row (and there is nothing
-    ' to write either). SAFETableToArray always reports the table's columns, so
-    ' this is a guard against a run-time subscript error mid-spill, not a normal
-    ' path; the cursor is left exactly where it was.
     If nCols < 1 Then
         ' Unreachable in practice (SAFETableToArray always reports the table's
-        ' columns), but a zero-width block cannot be sliced row by row and there
-        ' is nothing to write either. Reported as a FAILURE so rows SAFE returned
-        ' are never dropped silently: the caller counts it with the failed tables,
-        ' and the red marker below says where it happened.
+        ' columns), but a zero-width block cannot be sliced row by row. Reported
+        ' as a FAILURE so rows SAFE returned are never dropped silently.
         With CurSheet.Cells(r0, c0)
             .Value = "Table '" & Title & "' : FAILED - " & nRows & " data row(s) were " & _
                      "returned without any column(s), so they could not be written"
@@ -1791,19 +1934,14 @@ Public Function WriteTableBlock( _
     Do While rowsLeft > 0
         If sheetCount > 0 Then
             ' Continuation sheet: <BaseSheetName>_2, <BaseSheetName>_3, ...
-            ' (BaseSheetName is the name of the sheet this block STARTED on, so a
-            ' second spilled table - which starts on the last sheet the first one
-            ' used - nests off that sheet and cannot reuse a sheet that already
-            ' carries rows.)
+            ' (BaseSheetName is the name of the sheet this block STARTED on.)
             ' The "_N" SUFFIX is the part that has to survive, so the BASE name
             ' is cut short when the combination would exceed Excel's
             ' 31-character sheet-name limit: truncating the whole combination
-            ' instead could collapse the name back onto a sheet that is already
-            ' holding rows. A 31-character base name that already ends in the
-            ' same "_N" is the one case that can still rebuild the name of the
-            ' sheet being written on, which would overwrite the chunk just
-            ' written - so the index is advanced until the name differs (at most
-            ' a couple of iterations).
+            ' could collapse the name back onto a sheet that is already holding
+            ' rows. A 31-character base name that already ends in the same "_N"
+            ' is the one case that can still rebuild the name of the sheet being
+            ' written on, so the index is advanced until the name differs.
             Do
                 nameIdx = nameIdx + 1
                 suffix = "_" & nameIdx
@@ -1820,8 +1958,7 @@ Public Function WriteTableBlock( _
         End If
 
         ' Re-read the limits: a continuation sheet is normally identical to the
-        ' starting one (same start cell, same format), but this keeps the room
-        ' calculation honest whatever the sheet turns out to be.
+        ' starting one, but this keeps the room calculation honest.
         maxRow = CurSheet.Rows.Count
         maxCol = CurSheet.Columns.Count
         sheetCapacity = maxRow - (r0 - 1) - overheadRows
@@ -1850,8 +1987,8 @@ Public Function WriteTableBlock( _
         End If
 
         ' Slice this sheet's share out of Data into a fresh 1-based 2-D chunk and
-        ' bulk-write that. Only the spill path copies rows; offsetRows is the
-        ' number of rows already written, so no row is repeated or skipped.
+        ' bulk-write that. offsetRows is the number of rows already written, so no
+        ' row is repeated or skipped.
         ReDim chunk(1 To rowsThis, 1 To nCols)
         For ii = 1 To rowsThis
             For jj = 1 To nCols
@@ -1901,9 +2038,8 @@ Public Function WriteTableBlock( _
     End If
 
     If aborted Then
-        ' The block was only PARTLY written: report it as a FAILURE (-1) so the
-        ' caller counts it with the failed tables and the run reads as "this table
-        ' did not make it", never as a successful write of fewer rows.
+        ' Partly written: report it as a FAILURE (-1) so the caller counts it with
+        ' the failed tables rather than as a successful write of fewer rows.
         LogMsg "WriteTableBlock: table '" & Title & "' is INCOMPLETE - " & totalRows & _
                " of " & nRows & " data row(s) were written across " & sheetCount & _
                " worksheet(s); the remaining " & rowsLeft & " could not be written."
@@ -2301,6 +2437,37 @@ Private Function ParseStartCell( _
     ParseStartCell = True
 End Function
 
+Private Function CellRef(ByVal SheetName As String, ByVal RowNumber As Long, ByVal ColNumber As Long) As String
+    ' A1-style address of a row/column position, so the NextRow / NextCol cursor
+    ' that PrintTable and MarkTableFailed hand back can be fed straight into the
+    ' next StartCell of a multi-table loop.
+    Dim ws As Worksheet
+
+    If RowNumber < 1 Then RowNumber = 1
+    If ColNumber < 1 Then ColNumber = 1
+
+    On Error GoTo NoRef
+    Set ws = GetWorksheet(ThisWorkbook, SheetName)
+    CellRef = ws.Cells(RowNumber, ColNumber).Address(False, False)
+    Exit Function
+NoRef:
+    CellRef = "A1"
+End Function
+
+Private Function CellNumber(ByVal v As Variant) As Double
+    ' Numeric value of one data cell, for callers that calculate with the array.
+    ' SAFE returns the table text, so a number can arrive as a String: the fallback
+    ' is Val(), which reads "." as the decimal separator whatever the Windows
+    ' locale is (CDbl on a String follows the locale and would fail on "10.3").
+    On Error Resume Next
+    CellNumber = 0
+    If IsNumeric(v) Then
+        CellNumber = CDbl(v)
+    Else
+        CellNumber = Val(CStr(v))
+    End If
+End Function
+
 Private Function ArrLenStr(ByRef arr() As String) As Long
     ' Length of a dynamic String array; 0 if not dimensioned (avoids
     ' "Subscript out of range" when SAFE returns nothing).
@@ -2321,6 +2488,26 @@ Private Function ArrLenLng(ByRef arr() As Long) As Long
     Exit Function
 NoArr:
     ArrLenLng = 0
+End Function
+
+Private Function ArrRows(ByVal v As Variant) As Long
+    ' Row count of a 1-based 2-D Variant array; 0 when v is Empty or is not an
+    ' array at all (UBound raises on both, which is what the guard is for).
+    On Error GoTo NoArr
+    ArrRows = UBound(v, 1)
+    Exit Function
+NoArr:
+    ArrRows = 0
+End Function
+
+Private Function ArrCols(ByVal v As Variant) As Long
+    ' Column count of a 1-based 2-D Variant array; 0 when v is Empty or is not an
+    ' array at all.
+    On Error GoTo NoArr
+    ArrCols = UBound(v, 2)
+    Exit Function
+NoArr:
+    ArrCols = 0
 End Function
 
 ' ===========================================================================
@@ -2376,13 +2563,9 @@ Private Sub SetLastError( _
     ByVal Text As String, _
     Optional ByVal Hint As String = "")
     ' Hint is the extra guidance line printed under the message, and the CALLER
-    ' now chooses it. This routine used to append the "438 / check the SAFEv1
-    ' reference" hint UNCONDITIONALLY, which aimed the reader at the reference
-    ' library for failures that had nothing to do with it (an unknown table key,
-    ' an analysis that has not been run, a table that is not importable, a block
-    ' too wide for the worksheet). Pass ErrHint(438) where that advice really
-    ' applies, a specific hint where the cause is known, or nothing at all (the
-    ' default) when the message already says what to do.
+    ' chooses it: pass ErrHint(438) where that advice applies, a specific hint
+    ' where the cause is known, or nothing at all (the default) when the message
+    ' already says what to do.
 
     gLastErrNumber = 0
     gLastErrContext = Context
@@ -2516,68 +2699,42 @@ Public Sub ShowLog()
 End Sub
 
 Public Function GetLastExportFailures() As Long
-    ' Number of tables that FAILED in the last ExportSAFETables call (0 = none).
-    ' A failed table is one whose read could not be served - a nonzero
-    ' GetTableForDisplayArray code with NO column headers returned (the table key
-    ' is not valid for this model / SAFE version, or analysis has not been run),
-    ' or a COM error. Such a table is written to the destination sheet as a bold
-    ' red "Table '<key>' : FAILED - <reason>" marker, logged as an error, and is
-    ' NOT included in the number ExportSAFETables returns. A valid key that
-    ' simply has no rows is an EMPTY table, not a failure, and is not counted
-    ' here either - it gets the plain "no data returned" marker.
-    ' A WRITE failure is counted too: a table whose data WAS read but could not
-    ' be written in full (too wide for the worksheet, no room left for its
-    ' title/header rows, or a continuation sheet running out of room mid-spill)
-    ' gets the same bold red marker and is counted here.
+    ' Number of tables that FAILED since the last ResetExportFailures() call
+    ' (0 = none). Both halves count: a read that could not be served
+    ' (ExportSAFETables - a nonzero GetTableForDisplayArray code with NO column
+    ' headers returned, i.e. an invalid key for this model / SAFE version or
+    ' analysis not run, or a COM error) and a block the worksheet could not hold
+    ' (PrintTable - too wide for the sheet, no room for its title/header rows, or
+    ' a continuation sheet running out of room mid-spill). Each failure writes a
+    ' bold red "Table '<key>' : FAILED - <reason>" marker, is logged as an error,
+    ' and is NOT counted as a table that was written. A valid key with no rows is
+    ' an EMPTY table, not a failure, and is not counted here either.
     GetLastExportFailures = mFailedTables
 End Function
 
+Public Sub ResetExportFailures()
+    ' Start a new failure count. Call it once before a batch of chains
+    ' (ExportSAFETables + PrintTable per table), then read GetLastExportFailures()
+    ' when the batch is done.
+    mFailedTables = 0
+End Sub
+
 ' ===========================================================================
-' [COMMENTED OUT - HARDCODED IMPORT SECTION]
-' The SAFEv1.tlb reference is now added through the Excel VBA IDE and read
-' from that IDE setting, so nothing is hardcoded here any more.
-'
-' To add the reference:
+' ADDING THE SAFEv1 REFERENCE (once, by hand, in the Excel VBA IDE)
 '   1. Alt+F11 to open the VBA IDE.
 '   2. Tools > References...
-'   3. Tick "SAFEv1" if listed, otherwise Browse... and select SAFEv1.tlb
-'      from the SAFE installation folder (e.g. ...\SAFE 20\SAFEv1.tlb).
-'
-' (The old code that added the reference programmatically from a hardcoded
-'  path is commented out below. It required "Trust access to the VBA project
-'  object model" and a hardcoded path - neither is needed any more.)
+'   3. Tick "SAFEv1" if listed, otherwise Browse... and select SAFEv1.tlb from
+'      the SAFE installation folder (e.g. ...\SAFE 20\SAFEv1.tlb).
 ' ===========================================================================
-'
-'Public Sub SAFESetupReference()
-'    Dim ref As Object
-'    Dim found As Boolean
-'    found = False
-'    For Each ref In ThisWorkbook.VBProject.References
-'        If InStr(1, ref.Name, "SAFEv1", vbTextCompare) > 0 Then
-'            found = True
-'            Exit For
-'        End If
-'    Next ref
-'
-'    If found Then
-'        MsgBox "SAFEv1 reference already present: " & ref.Name, vbInformation
-'        Exit Sub
-'    End If
-'
-'    On Error GoTo RefFail
-'    ThisWorkbook.VBProject.References.AddFromFile ""   ' path was hardcoded
-'    MsgBox "Added SAFEv1 reference.", vbInformation
-'    Exit Sub
-'
-'RefFail:
-'    MsgBox "Could not add reference:" & vbCrLf & Err.Description, vbExclamation
-'End Sub
 
 ' ===========================================================================
 ' DEMOS
 ' ===========================================================================
 
-' Example: export several tables to a sheet, stacked downwards from A1.
+' Example: several tables, read and printed one at a time, stacked downwards
+' from A1. This is the shape of every multi-table caller now: PART 1 reads a
+' table into an array, PART 2 prints that array, and the cursor PrintTable hands
+' back says where the next block goes.
 Public Sub DemoExport()
     Dim Tables() As String
     ReDim Tables(0 To 2)
@@ -2585,52 +2742,174 @@ Public Sub DemoExport()
     Tables(1) = "Area Load Assignments - Uniform"
     Tables(2) = "Element Forces - Area Shells"   ' requires analysis results
 
-    Dim n As Long
-    n = ExportSAFETables(Tables, DEF_SHEET, DEF_START, False, True)
-    If n >= 0 Then
-        MsgBox "Exported " & n & " of " & (UBound(Tables) - LBound(Tables) + 1) & _
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+    Dim cell As String
+    Dim nextRow As Long, nextCol As Long
+    Dim written As Long
+    Dim i As Long
+
+    ResetExportFailures
+    cell = DEF_START
+
+    For i = LBound(Tables) To UBound(Tables)
+        ' PART 1 - SAFE -> 2-D array
+        data = ExportSAFETables(Tables(i), hdrs, , , warn, failed)
+
+        ' PART 2 - 2-D array -> sheet (or the red marker when the READ failed)
+        If failed Then
+            MarkTableFailed DEF_SHEET, cell, Tables(i), warn, , nextRow, nextCol
+        Else
+            If PrintTable(data, DEF_SHEET, cell, Tables(i), hdrs, , , , _
+                          nextRow, nextCol) >= 0 Then
+                written = written + 1
+            End If
+        End If
+
+        cell = CellRef(DEF_SHEET, nextRow, nextCol)
+    Next i
+
+    If GetLastExportFailures() = 0 Then
+        MsgBox "Exported " & written & " of " & (UBound(Tables) - LBound(Tables) + 1) & _
                " table(s) to sheet '" & DEF_SHEET & "' at " & DEF_START & ".", _
                vbInformation
     Else
-        MsgBox "Export failed - see Immediate window (Ctrl+G) / ShowLog.", vbExclamation
+        MsgBox "Exported " & written & " table(s); " & GetLastExportFailures() & _
+               " FAILED - see the red markers on sheet '" & DEF_SHEET & _
+               "' and the Immediate window (Ctrl+G) / ShowLog.", vbExclamation
     End If
 End Sub
 
-' Example: a single table, at a specific tab + coordinate.
+' Example: one table at a specific tab + coordinate - the chain in its shortest
+' form.
 Public Sub DemoExportSingle()
-    Dim n As Long
-    n = ExportSAFETables("Element Forces - Area Shells", "SAFE Forces", "B2")
-    If n < 0 Then
+    Const TABLE_KEY As String = "Element Forces - Area Shells"
+    Const SHEET_NAME As String = "SAFE Forces"
+    Const START_CELL As String = "B2"
+
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+
+    ResetExportFailures
+    data = ExportSAFETables(TABLE_KEY, hdrs, , , warn, failed)
+
+    If failed Then
+        MarkTableFailed SHEET_NAME, START_CELL, TABLE_KEY, warn
         MsgBox "Export failed - see Immediate window (Ctrl+G) / ShowLog.", vbExclamation
+        Exit Sub
     End If
+
+    PrintTable data, SHEET_NAME, START_CELL, TABLE_KEY, hdrs
 End Sub
 
 ' Example: only include specific load cases in the result tables.
 ' ("LIVE, DEAD" or Array("LIVE","DEAD") also work.)
-' For load COMBINATIONS (e.g. "1.4DL+1.6LL") use the LoadCombos argument instead
-' - see DemoExportFilteredCombo below. The two filters are independent, and SAFE
-' keeps load cases and load combinations as separate lists.
+' The filter belongs to PART 1, because it changes what SAFE returns.
 Public Sub DemoExportFiltered()
-    Dim n As Long
-    n = ExportSAFETables("Element Forces - Area Shells", "SAFE Forces LIVE", "B2", _
-                         LoadCases:="LIVE")
-    If n < 0 Then
+    Const TABLE_KEY As String = "Element Forces - Area Shells"
+    Const SHEET_NAME As String = "SAFE Forces LIVE"
+    Const START_CELL As String = "B2"
+
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+
+    ResetExportFailures
+    data = ExportSAFETables(TABLE_KEY, hdrs, LoadCases:="LIVE", _
+                            Warning:=warn, Failed:=failed)
+
+    If failed Then
+        MarkTableFailed SHEET_NAME, START_CELL, TABLE_KEY, warn
         MsgBox "Export failed - see Immediate window (Ctrl+G) / ShowLog.", vbExclamation
+        Exit Sub
     End If
+
+    PrintTable data, SHEET_NAME, START_CELL, TABLE_KEY, hdrs
 End Sub
 
 ' Example: only include specific load COMBINATIONS in the result tables - the
 ' names SAFE shows under "Load Combinations" (the pile-cap sheet filters by
 ' combination, e.g. "1.4DL+1.6LL" / "1.4(D+WH)"). A combination name that SAFE
-' does not know makes the export fail with -1 rather than exporting unfiltered
-' force results - the log names the rejected string.
+' does not know makes the READ fail rather than handing back unfiltered force
+' results - the log names the rejected string.
 Public Sub DemoExportFilteredCombo()
-    Dim n As Long
-    n = ExportSAFETables("Element Forces - Area Shells", "SAFE Forces COMBO", "B2", _
-                         LoadCombos:="1.4DL+1.6LL")
-    If n < 0 Then
+    Const TABLE_KEY As String = "Element Forces - Area Shells"
+    Const SHEET_NAME As String = "SAFE Forces COMBO"
+    Const START_CELL As String = "B2"
+
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+
+    ResetExportFailures
+    data = ExportSAFETables(TABLE_KEY, hdrs, LoadCombos:="1.4DL+1.6LL", _
+                            Warning:=warn, Failed:=failed)
+
+    If failed Then
+        MarkTableFailed SHEET_NAME, START_CELL, TABLE_KEY, warn
         MsgBox "Export failed - see Immediate window (Ctrl+G) / ShowLog.", vbExclamation
+        Exit Sub
     End If
+
+    PrintTable data, SHEET_NAME, START_CELL, TABLE_KEY, hdrs
+End Sub
+
+' Example: what the split is FOR - process the data in VBA before it is written.
+' Here the largest value of one column is found and logged, and the same array is
+' then printed, so the sheet and the calculation come from ONE read of the table.
+Public Sub DemoProcessTable()
+    Const TABLE_KEY As String = "Element Forces - Area Shells"
+    Const COLUMN_KEY As String = "M11"                  ' a column key of that table
+    Const OUT_SHEET As String = "SAFE Forces max"
+    Const OUT_CELL As String = "B2"
+
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+    Dim colIdx As Long
+    Dim r As Long
+    Dim v As Double
+    Dim best As Double
+    Dim bestRow As Long
+
+    ResetExportFailures
+    data = ExportSAFETables(TABLE_KEY, hdrs, , , warn, failed)
+
+    If failed Then
+        MarkTableFailed OUT_SHEET, OUT_CELL, TABLE_KEY, warn
+        MsgBox "Read failed - see Immediate window (Ctrl+G) / ShowLog.", vbExclamation
+        Exit Sub
+    End If
+
+    ' The column is located BY NAME in the returned keys, and the same number
+    ' indexes the data array: SAFE may reorder its columns freely.
+    colIdx = TableColumnIndex(hdrs, COLUMN_KEY)
+    If colIdx > 0 Then
+        best = -1E+300
+        For r = 1 To ArrRows(data)
+            v = CellNumber(data(r, colIdx))
+            If v > best Then
+                best = v
+                bestRow = r
+            End If
+        Next r
+        LogMsg "DemoProcessTable: largest " & COLUMN_KEY & " in '" & TABLE_KEY & _
+               "' is " & best & " (data row " & bestRow & ")."
+    Else
+        LogMsg "DemoProcessTable: '" & TABLE_KEY & "' does not report a column '" & _
+               COLUMN_KEY & "' (" & ArrLenStr(hdrs) & " column(s) reported)."
+    End If
+
+    ' The array that was processed is the array that gets printed.
+    PrintTable data, OUT_SHEET, OUT_CELL, TABLE_KEY, hdrs
+    LogMsg "DemoProcessTable: " & GetLastExportFailures() & " failed block(s)."
 End Sub
 
 ' Example: dump all available table keys so you can pick exact names.

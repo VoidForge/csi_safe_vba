@@ -15,13 +15,15 @@ Option Explicit
 '    prefixes - e.g. "Pile_1_3" and "Pile_1_7" both follow the prefix "Pile_1".
 '    Matching is case-insensitive and the FIRST matching prefix in the sheet
 '    wins, so an overlapping pair is resolved by putting the more specific
-'    prefix first (no extra logic, as agreed).
+'    prefix first.
 '
 '  REQUIRES
 '    - The companion module SAFE_Library.bas in the same workbook. It supplies
-'      SAFEConnect, the editing-table read (SAFEReadEditingTable), the write-back
-'      (WriteSAFETable: ImportType preflight, unlock only if needed, edit +
-'      ApplyEditedTables, lock restore) and the shared log (LogMsg).
+'      SAFEConnect, the table read (ExportSAFETables -> 2-D array) with its
+'      sheet-side other half (PrintTable / MarkTableFailed), the editing-table
+'      read (SAFEReadEditingTable), the write-back (WriteSAFETable: ImportType
+'      preflight, unlock only if needed, edit + ApplyEditedTables, lock restore)
+'      and the shared log (LogMsg).
 '    - SAFE open with the model loaded, and the SAFEv1 reference ticked in the
 '      VBA IDE (Tools > References...).
 '
@@ -377,8 +379,7 @@ Private Function BuildReport( _
     End If
 
     ' Verify with the SAME rule the edit used - for each point, the FIRST prefix
-    ' it matches - so a point cannot be counted once as "correct" and once as a
-    ' mismatch just because two prefixes both happen to start it.
+    ' it matches.
     ReDim okCount(1 To nPfx)
     ReDim badCount(1 To nPfx)
     For r = 1 To nRows
@@ -457,10 +458,13 @@ End Sub
 ' ReadResultTableForCases is the generic worker: table key, load cases, sheet and
 ' top-left cell are all ARGUMENTS. It exists because SAFE keeps load CASES and
 ' load COMBINATIONS as two independent "selected for display" lists, and every use
-' in this workbook wants cases only:
+' in this workbook wants cases only. It drives the library's TWO halves in chain:
 '
-'   * the requested load cases are handed to SAFE_Library.ExportSAFETables, which
-'     applies them, writes the table and puts the caller's case selection back;
+'   * PART 1 - ExportSAFETables reads the table into a 2-D array with the requested
+'     load cases applied (and puts the caller's case selection back before it
+'     returns);
+'   * PART 2 - PrintTable writes that array at the requested top-left cell, or
+'     MarkTableFailed leaves a bold red marker there when the READ failed;
 '   * the COMBINATION display selection is cleared here FIRST (a list holding a
 '     single blank string is SAFE's documented way of selecting none) and put back
 '     at the end, on the normal path AND on the error path - so the table cannot
@@ -479,9 +483,9 @@ End Sub
 '     quietly reinterpreted as "all cases".
 '   * passed with entries: only those cases are read (blank entries are ignored).
 '
-' Returns the number of tables written (1 normally, 0 when there was nothing to
-' write at all or no usable case was named, -1 on a fatal error). Messages go
-' through Say, so they are logged whether or not MsgBoxLogging is on.
+' Returns 1 when the table was dealt with, 0 when there was nothing to do at all
+' or no usable case was named, -1 on a fatal error. Messages go through Say, so
+' they are logged whether or not MsgBoxLogging is on.
 Public Function ReadResultTableForCases( _
     ByVal TableKey As String, _
     ByVal LoadCases As Variant, _
@@ -490,11 +494,11 @@ Public Function ReadResultTableForCases( _
     Optional ByVal IncludeHeader As Boolean = False) As Long
     ' IncludeHeader is False by DEFAULT, and it suppresses the WHOLE block
     ' header: what lands on the sheet is the DATA alone, flush on TopLeftCell -
-    ' no title row and no column-header row (and the column keys are not even
-    ' fetched from SAFE, see SAFETableToArray's ReturnHeaders). That is the layout
-    ' this workbook wants for result tables. Pass True for the labelled block
-    ' instead - the table key on the first row and SAFE's column keys on the
-    ' second - which moves the first data row two rows further down.
+    ' no title row and no column-header row, because PrintTable is called with
+    ' WriteTitle:=False and WriteHeader:=False. That is the layout this workbook
+    ' wants for result tables. Pass True for the labelled block instead - the
+    ' table key on the first row and SAFE's column keys on the second - which
+    ' moves the first data row two rows further down.
 
     Dim savedCombos() As String
     Dim nSavedCombos As Long
@@ -514,6 +518,11 @@ Public Function ReadResultTableForCases( _
     Dim parts As Variant
     Dim i As Long
     Dim reason As String
+    Dim hdrs() As String
+    Dim data As Variant
+    Dim warn As String
+    Dim failed As Boolean
+    Dim blockResult As Long
 
     none(0) = ""                       ' SAFE: a single blank = select NOTHING
 
@@ -647,32 +656,49 @@ Public Function ReadResultTableForCases( _
         clearedCombos = True
     End If
 
-    ' ---- 4. export: load cases only (no LoadCombos argument at all) --------
+    ' ---- 4. read the table, then write it: the two library halves in chain --
     ' resolvedCases is the caller's list, or the model's full case list when the
     ' argument was empty (section 1b). Never LoadCombos: combinations must stay
     ' cleared for the read, which is the whole point of this worker.
-    ' IncludeHeader goes through to SAFE_Library, which drives the TITLE row and
-    ' the column-header row with it alike, and also decides with it whether the
-    ' column keys are fetched at all (SAFETableToArray's ReturnHeaders).
-    written = ExportSAFETables(TableKey, SheetName, TopLeftCell, _
-                               IncludeHeader:=IncludeHeader, LoadCases:=resolvedCases)
+    ' PART 1 - SAFE -> 2-D array. hdrs comes back with SAFE's column keys.
+    ResetExportFailures            ' the count reported below belongs to THIS read
+    data = ExportSAFETables(TableKey, hdrs, LoadCases:=resolvedCases, _
+                            Warning:=warn, Failed:=failed)
 
-    If written < 0 Then
-        Say "ReadResultTableForCases: exporting '" & TableKey & "' failed - the " & _
-            "log names the reason, and LastErrorText() gives the last one." & vbCrLf & _
-            vbCrLf & "If SAFE reports the table key is unknown, run " & _
-            "ListSAFETables (or DemoListTables) to list the keys THIS model " & _
-            "reports.", vbExclamation
-    ElseIf written = 0 Then
-        Say "ReadResultTableForCases: '" & TableKey & "' produced no data for " & _
-            caseDesc & "." & vbCrLf & vbCrLf & _
-            "Check that the case names match SAFE exactly (casing included) and " & _
-            "that the analysis has been run.", vbExclamation
+    If failed Then
+        ' PART 2, failure path - the red marker, so the sheet shows that this
+        ' table was asked for and did not come back.
+        MarkTableFailed SheetName, TopLeftCell, TableKey, warn
+        written = -1
+        Say "ReadResultTableForCases: reading '" & TableKey & "' failed - " & _
+            "the log names the reason (" & warn & "), and LastErrorText() gives " & _
+            "the last one." & vbCrLf & vbCrLf & _
+            "If SAFE reports the table key is unknown, run ListSAFETables (or " & _
+            "DemoListTables) to list the keys THIS model reports.", vbExclamation
     Else
-        LogMsg "ReadResultTableForCases: '" & TableKey & "' written to '" & _
-               SheetName & "'!" & TopLeftCell & " for " & caseDesc & ", load cases " & _
-               "only, combinations cleared for the read (" & GetLastExportFailures() & _
-               " table(s) failed)."
+        ' PART 2 - 2-D array -> sheet. IncludeHeader drives BOTH the title row
+        ' and the column-header row of the block.
+        blockResult = PrintTable(data, SheetName, TopLeftCell, TableKey, hdrs, _
+                                 WriteTitle:=IncludeHeader, WriteHeader:=IncludeHeader)
+        If blockResult < 0 Then
+            written = -1
+            Say "ReadResultTableForCases: '" & TableKey & "' was read, but could " & _
+                "NOT be written to '" & SheetName & "' - see the bold red marker " & _
+                "on that sheet and the log.", vbExclamation
+        Else
+            written = 1
+            If IsEmpty(data) Then
+                Say "ReadResultTableForCases: '" & TableKey & "' produced no data " & _
+                    "for " & caseDesc & "." & vbCrLf & vbCrLf & _
+                    "Check that the case names match SAFE exactly (casing included) " & _
+                    "and that the analysis has been run.", vbExclamation
+            Else
+                LogMsg "ReadResultTableForCases: '" & TableKey & "' written to '" & _
+                       SheetName & "'!" & TopLeftCell & " for " & caseDesc & ", load " & _
+                       "cases only, combinations cleared for the read (" & _
+                       GetLastExportFailures() & " table(s) failed)."
+            End If
+        End If
     End If
 
     GoTo CleanUp
@@ -694,7 +720,7 @@ CleanUp:
         If SelectedNameCount(savedCombos) > 0 Then
             ret = gDB.SetLoadCombinationsSelectedForDisplay(savedCombos)
         Else
-            ret = gDB.SetLoadCombinationsSelectedForDisplay(none)  ' was: none
+            ret = gDB.SetLoadCombinationsSelectedForDisplay(none)
         End If
         errNum = Err.Number
         errDesc = Err.Description
@@ -756,20 +782,19 @@ End Function
 Public Sub WriteNodalReactions1()
     ' ---- EDIT THESE --------------------------------------------------------
     Const REACT_SHEET As String = "Nodal Reactions"     ' <-- EDIT ME
-    Const REACT_TOPLEFT As String = "B3"                ' <-- EDIT ME (corner only)
+    Const REACT_TOPLEFT As String = "B5"                ' <-- EDIT ME (corner only)
 
     ' Load CASES to include - NOT load combinations: combinations are cleared for
     ' the duration of the read, so a combination row cannot slip into this table.
     ' Blank entries and duplicates are ignored; casing must match SAFE exactly.
-    Const REACT_LOADCASES As String = "DEAD, LIVE"      ' <-- EDIT ME
+    Const REACT_LOADCASES As String = ""      ' <-- EDIT ME
 
     ' SAFE's nodal-reaction result table, verified against the shipped key list
     ' reference\SAFE Input&Output Table Key List.csv : "Joint Reactions", Import
-    ' Type 0 - a RESULT table, which is why it can be read here but never written
-    ' back (WriteSAFETable refuses Import Type 0 by design). Keys are per model /
-    ' SAFE version, so ListSAFETables is the way to check them elsewhere: a wrong
-    ' key writes NOTHING - a bold red FAILED marker names the key in the log,
-    ' instead of exporting the wrong data.
+    ' Type 0 - a RESULT table, so it can be read here but never written back.
+    ' Keys are per model / SAFE version, so ListSAFETables is the way to check
+    ' them elsewhere: a wrong key writes NOTHING and writes a bold red FAILED
+    ' marker naming the key.
     Const REACT_TABLE As String = "Joint Reactions"     ' <-- from the key list CSV
     ' ------------------------------------------------------------------------
 
@@ -881,8 +906,7 @@ Private Function ReadCoordTable( _
 End Function
 
 ' 1-based index of a column key in the Headers array (0 when it is not there).
-' Case- and space-insensitive, so a minor spelling difference in the key does not
-' break the sub.
+' Case- and space-insensitive.
 Private Function ColIndex(ByRef hdrs() As String, ByVal wanted As String) As Long
     Dim i As Long, n As Long
     Dim probe As String
@@ -898,9 +922,8 @@ Private Function ColIndex(ByRef hdrs() As String, ByVal wanted As String) As Lon
     ColIndex = 0
 End Function
 
-' Plain prefix test, case-insensitive: "Pile_1" matches "Pile_1_3" and does NOT
-' match "Pile_10" only because that starts with "Pile_1" too - which is why the
-' caller applies the FIRST matching prefix and the sheet's order decides.
+' Plain prefix test, case-insensitive: "Pile_1" also matches "Pile_10", which is
+' why the caller applies the FIRST matching prefix.
 Private Function StartsWith(ByVal Text As String, ByVal Prefix As String) As Boolean
     If Len(Prefix) = 0 Then Exit Function
     StartsWith = (StrComp(Left$(Text, Len(Prefix)), Prefix, vbTextCompare) = 0)
@@ -995,8 +1018,8 @@ NoUnits:
     TableFieldUnits = Fallback
 End Function
 
-' Length of a dynamic String array; 0 when it is not dimensioned. This module is a
-' separate VBA module, so it needs its own copy of the guard SAFE_Library uses
+' Length of a dynamic String array; 0 when it is not dimensioned. This module is
+' a separate VBA module, so it needs its own copy of the guard SAFE_Library uses
 ' internally (that one is private to SAFE_Library).
 Private Function ItemCount(ByRef a() As String) As Long
     On Error GoTo NoArr
