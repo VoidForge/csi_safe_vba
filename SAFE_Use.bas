@@ -148,6 +148,42 @@ Public Sub ApplyPileCoordinates1()
 End Sub
 
 ' ===========================================================================
+' RUN ANALYSIS - entry point; it does this one thing and nothing else
+' ===========================================================================
+' Attaches to the running SAFE instance and starts the analysis. No settings, no
+' sheet, no table: it does NOT save the model, does NOT touch the lock and does
+' NOT change the display filters. A message goes through Say, so it lands in the
+' shared log whether or not message boxes are on (ShowLog reads it back).
+Public Sub RunAnalysis1()
+    Dim ret As Long
+
+    If Not SAFEConnect() Then
+        Say "RunAnalysis1: could not attach to a running SAFE instance, so no " & _
+            "analysis was started." & vbCrLf & vbCrLf & _
+            "Detail: " & LastErrorText(), vbExclamation
+        Exit Sub
+    End If
+
+    On Error GoTo Fail
+    ret = gSapModel.Analyze.RunAnalysis()
+
+    If ret <> 0 Then
+        Say "RunAnalysis1: SAFE did not run the analysis (return code " & ret & ")." & _
+            vbCrLf & vbCrLf & "Check the model in SAFE - ShowLog has the detail.", _
+            vbExclamation
+    Else
+        Say "RunAnalysis1: the analysis was run on '" & _
+            gSapModel.GetModelFilepath() & "'." & vbCrLf & vbCrLf & _
+            "This sub does not save the model.", vbInformation
+    End If
+    Exit Sub
+
+Fail:
+    Say "RunAnalysis1 stopped on an unexpected error: " & Err.Number & " - " & _
+        Err.Description & vbCrLf & vbCrLf & "ShowLog has the full log.", vbExclamation
+End Sub
+
+' ===========================================================================
 ' WORKER - SetPointCoordinates(SheetName, RangeAddress)
 ' ===========================================================================
 Public Sub SetPointCoordinates(ByVal SheetName As String, ByVal RangeAddress As String)
