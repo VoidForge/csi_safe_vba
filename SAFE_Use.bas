@@ -781,6 +781,11 @@ End Function
 '
 '     Node | OutputCase | Fx | Fy | Fz | Mx | My | Mz
 '
+' The six force / moment columns are DIVIDED by FORCE_DIV (1000) as they are
+' written, so the sheet holds the converted value; the identifiers are written as
+' they come, and a cell that is not a number is never turned into arithmetic. That
+' one constant at the top of the sub is the only place the conversion lives.
+'
 ' Only the TOP-LEFT cell of the destination is given: the block lands there
 ' FLUSH - no title row and no header row - and its columns extend right and down
 ' from there (a block too big for one worksheet continues on <REACT_SHEET>_2,
@@ -804,6 +809,15 @@ Public Sub WriteNodalReactions1()
     ' them elsewhere: a wrong key writes NOTHING and writes a bold red FAILED
     ' marker naming the key.
     Const REACT_TABLE As String = "Joint Reactions"     ' <-- from the key list CSV
+
+    ' The block's six force / moment columns (Fx, Fy, Fz, Mx, My, Mz) are DIVIDED
+    ' by this before they are written, so the sheet carries the model's units
+    ' converted (1000 turns N into kN, kN into MN, N.mm into kN.m ...). The six
+    ' columns are recognised BY NAME in the output list below, so this one number
+    ' is the only place the conversion lives. A cell that does NOT read as a
+    ' number ("N/A", a note, a blank) is written exactly as SAFE returned it -
+    ' no arithmetic is invented for it.
+    Const FORCE_DIV As Double = 1000                    ' <-- EDIT ME
     ' ------------------------------------------------------------------------
 
     Dim savedCombos() As String
@@ -825,6 +839,7 @@ Public Sub WriteNodalReactions1()
     Dim outHdrs() As String        ' the block's columns, in output order
     Dim outSrc() As String         ' SAFE key each output column comes from
     Dim outIx() As Long            ' 1-based index of that key in the data array
+    Dim outDiv() As Double         ' divisor per output column (1 = as it comes)
     Dim nOut As Long               ' number of output columns
     Dim fzAt As Long               ' output position of Fz (the row filter)
     Dim missing As String          ' output columns SAFE did not report
@@ -967,8 +982,22 @@ Public Sub WriteNodalReactions1()
     outHdrs = Split("Node,OutputCase,Fx,Fy,Fz,Mx,My,Mz", ",")
     outSrc = Split("Node|UniqueName|Label,OutputCase,Fx,Fy,Fz,Mx,My,Mz", ",")
 
+    ' STEP 6a-2 - the DIVISOR per column. The identifiers (Node, OutputCase) are
+    ' written as they come; the six force / moment columns (Fx, Fy, Fz, Mx, My,
+    ' Mz) are divided by FORCE_DIV - see the constant at the top of the sub. They
+    ' are recognised BY NAME, so the list just above stays the only place that
+    ' says which columns come out, and a column added to it is divided
+    ' automatically. outDiv is index-parallel to outHdrs / outSrc.
     nOut = UBound(outHdrs) - LBound(outHdrs) + 1
     ReDim outIx(0 To nOut - 1)
+    ReDim outDiv(0 To nOut - 1)
+    For c = 0 To nOut - 1
+        If IsForceColumn(CStr(outHdrs(c))) Then
+            outDiv(c) = FORCE_DIV
+        Else
+            outDiv(c) = 1
+        End If
+    Next c
     missing = ""
     mapNote = ""
     fzAt = -1
@@ -1022,11 +1051,14 @@ Public Sub WriteNodalReactions1()
     nCols = UBound(data, 2)
     On Error GoTo Fail
 
-    ' STEP 6b - which ROWS reach the sheet, and the projection in one pass. A row
-    ' is dropped when its Fz cell reads as a zero; a blank cell is not a zero and
-    ' is kept. The survivors are copied COLUMN BY COLUMN into the output list, so
-    ' the block that comes out is nKept rows x nOut columns and holds nothing but
-    ' Node, OutputCase, Fx, Fy, Fz, Mx, My, Mz.
+    ' STEP 6b - which ROWS reach the sheet, the projection and the unit scaling,
+    ' in one pass. A row is dropped when its RAW Fz cell reads as a zero; a blank
+    ' cell is not a zero and is kept. The survivors are copied COLUMN BY COLUMN
+    ' into the output list, so the block that comes out is nKept rows x nOut
+    ' columns and holds nothing but Node, OutputCase, Fx, Fy, Fz, Mx, My, Mz -
+    ' with the six force / moment columns divided by FORCE_DIV on the way through
+    ' (ScaledBy). The Fz test uses the raw value: dividing by 1000 cannot turn a
+    ' zero into a non-zero or the other way round.
     nKept = 0
     If nRows > 0 And nCols > 0 Then
         ' which rows survive (1 = keep, 0 = drop)
@@ -1041,8 +1073,8 @@ Public Sub WriteNodalReactions1()
             End If
         Next r
 
-        ' the survivors, as a block of exactly that many rows - and of exactly
-        ' the output columns, in the output order
+        ' the survivors, as a block of exactly that many rows - of exactly the
+        ' output columns, in the output order, each divided by its own divisor
         If nKept > 0 Then
             ReDim kept(1 To nKept, 1 To nOut)
             k = 0
@@ -1050,7 +1082,7 @@ Public Sub WriteNodalReactions1()
                 If keepRow(r) = 1 Then
                     k = k + 1
                     For c = 0 To nOut - 1
-                        kept(k, c + 1) = data(r, outIx(c))
+                        kept(k, c + 1) = ScaledBy(data(r, outIx(c)), outDiv(c))
                     Next c
                 End If
             Next r
@@ -1061,7 +1093,8 @@ Public Sub WriteNodalReactions1()
 
     LogMsg "WriteNodalReactions1: '" & REACT_TABLE & "' - " & nRows & " row(s) read, " & _
            nKept & " kept (rows with Fz = 0 dropped), " & nCols & " column(s) read, " & _
-           nOut & " written (" & Join(outHdrs, ", ") & ")."
+           nOut & " written (" & Join(outHdrs, ", ") & "); Fx / Fy / Fz / Mx / My / " & _
+           "Mz divided by " & FORCE_DIV & "."
 
     ' ---- 7. write (PART 2 of the library pair) -----------------------------
     ' outHdrs travels with the block so that a labelled block (WriteHeader:=True)
@@ -1252,6 +1285,88 @@ End Function
 Private Function SameKey(ByVal a As String, ByVal b As String) As Boolean
     SameKey = (Replace(UCase$(Trim$(a)), " ", "") = _
                Replace(UCase$(Trim$(b)), " ", ""))
+End Function
+
+' True for the six force / moment columns - Fx, Fy, Fz, Mx, My, Mz: one letter F
+' or M followed by one axis letter. Recognising them BY NAME is what lets
+' WriteNodalReactions1 keep ONE column list: a column added there that looks like
+' a force or a moment is scaled by FORCE_DIV automatically.
+Private Function IsForceColumn(ByVal name As String) As Boolean
+    Dim n As String
+
+    n = Replace(UCase$(Trim$(name)), " ", "")
+    If Len(n) <> 2 Then Exit Function
+    If InStr("FM", Left$(n, 1)) = 0 Then Exit Function
+    IsForceColumn = (InStr("XYZ", Right$(n, 1)) > 0)
+End Function
+
+' One cell as it goes into the output block: divided by Div when it reads as a
+' NUMBER, otherwise handed on EXACTLY as SAFE returned it. Div = 1 hands back the
+' original Variant untouched, so a column that is not scaled stays byte-for-byte
+' what SAFE wrote (text stays text). Nothing is invented for a cell that is not a
+' number - a blank stays blank, and "N/A" or a note is never turned into
+' arithmetic.
+Private Function ScaledBy(ByVal v As Variant, ByVal Div As Double) As Variant
+    Dim d As Double
+
+    If Div = 1 Then
+        ScaledBy = v
+        Exit Function
+    End If
+
+    If IsEmpty(v) Or IsNull(v) Then
+        ScaledBy = v
+        Exit Function
+    End If
+
+    If VarType(v) = vbString Then
+        If Not TextToNumber(CStr(v), d) Then
+            ScaledBy = v
+            Exit Function
+        End If
+    ElseIf IsNumeric(v) Then
+        d = CDbl(v)
+    Else
+        ScaledBy = v
+        Exit Function
+    End If
+
+    ScaledBy = d / Div
+End Function
+
+' True when the text reads COMPLETELY as a number, and Value comes back with it.
+' Only sign, digits, a decimal point and an exponent marker are accepted, so a note
+' ("N/A", "12abc", "see note") is NOT a number while "-4", "0.000" and "1.23E-05"
+' are. Val() then parses it with "." as the decimal separator whatever the Windows
+' locale is - the same reading the Fz row filter uses.
+Private Function TextToNumber(ByVal t As String, ByRef Value As Double) As Boolean
+    Dim i As Long, n As Long
+    Dim ch As String
+    Dim digits As Long
+
+    t = Trim$(t)
+    n = Len(t)
+    If n = 0 Then Exit Function
+
+    For i = 1 To n
+        ch = Mid$(t, i, 1)
+        Select Case ch
+            Case "0" To "9"
+                digits = digits + 1
+            Case "+", "-", "."
+                ' allowed punctuation
+            Case "E", "e"
+                ' an exponent marker must be followed by a digit or a sign
+                If i = n Then Exit Function
+                If InStr("0123456789+-", Mid$(t, i + 1, 1)) = 0 Then Exit Function
+            Case Else
+                Exit Function               ' not a number at all
+        End Select
+    Next i
+
+    If digits = 0 Then Exit Function
+    Value = Val(t)
+    TextToNumber = True
 End Function
 
 ' Plain prefix test, case-insensitive: "Pile_1" also matches "Pile_10", which is

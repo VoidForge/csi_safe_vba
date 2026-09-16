@@ -264,15 +264,27 @@ columns, in this order — every other column SAFE reports is left behind:
 
 Two labelled blocks inside the sub are the single place to change the output:
 **step 6a** holds the column list (`outHdrs` — the eight names written — and
-`outSrc`, the SAFE key(s) each one is taken from), and **step 6b** holds the row
-filter (`Fz = 0` rows are dropped; a blank `Fz` cell is not a zero and is kept).
-Columns are resolved **by name** against the keys SAFE returned, never by
-position, so SAFE may reorder its columns freely; each `outSrc` entry is a
-`"a|b"` candidate list tried left to right, so a key SAFE renames between versions
-still resolves — `Node` is this block's own name for the point identifier and
-resolves to `UniqueName`, falling back to `Label` (the substitution is logged). A
-required column the model does not report writes **nothing** and says which key
-was looked for, rather than exporting a block with a missing or misaligned column.
+`outSrc`, the SAFE key(s) each one is taken from) and the per-column divisor
+(`outDiv`), and **step 6b** holds the row filter (`Fz = 0` rows are dropped; a
+blank `Fz` cell is not a zero and is kept). Columns are resolved **by name**
+against the keys SAFE returned, never by position, so SAFE may reorder its columns
+freely; each `outSrc` entry is a `"a|b"` candidate list tried left to right, so a
+key SAFE renames between versions still resolves — `Node` is this block's own name
+for the point identifier and resolves to `UniqueName`, falling back to `Label`
+(the substitution is logged). A required column the model does not report writes
+**nothing** and says which key was looked for, rather than exporting a block with a
+missing or misaligned column.
+
+**Unit scaling.** The six force / moment columns (`Fx`, `Fy`, `Fz`, `Mx`, `My`,
+`Mz`) are **divided by `FORCE_DIV`** as they are written — the constant sits in the
+sub's *EDIT THESE* block, set to `1000` (so N → kN, kN → MN, N·mm → kN·m, …). The
+columns are recognised by name (one letter `F`/`M` plus an axis letter), so adding
+another force or moment column to the list scales it automatically, and the
+division is applied during the projection in step 6b, never to the raw array — the
+`Fz = 0` row filter therefore tests the value SAFE reported. A cell that does not
+read as a number (a blank, `N/A`, a note) is written exactly as SAFE returned it:
+no arithmetic is invented for it. Identifiers (`Node`, `OutputCase`) are written
+as they come.
 
 ## Table keys
 
