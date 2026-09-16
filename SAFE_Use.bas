@@ -773,8 +773,14 @@ End Function
 ' ---------------------------------------------------------------------------
 ' NODAL REACTIONS - entry point; its settings are LOCAL constants inside it
 ' ---------------------------------------------------------------------------
-' The table is READ into a 2-D array, the rows whose Fz is zero are dropped
-' (step 6 is the standalone place to change that), and what is left is PRINTED.
+' The table is READ into a 2-D array, PROJECTED onto a fixed column list (step
+' 6 - the single place to change which columns reach the sheet), the rows whose
+' Fz is zero are dropped (step 6 as well), and what is left is PRINTED.
+' The block that lands on the sheet carries EXACTLY these columns, in this
+' order - every other column SAFE reports is left behind:
+'
+'     Node | OutputCase | Fx | Fy | Fz | Mx | My | Mz
+'
 ' Only the TOP-LEFT cell of the destination is given: the block lands there
 ' FLUSH - no title row and no header row - and its columns extend right and down
 ' from there (a block too big for one worksheet continues on <REACT_SHEET>_2,
@@ -816,7 +822,14 @@ Public Sub WriteNodalReactions1()
     Dim warn As String
     Dim failed As Boolean
     Dim nRows As Long, nCols As Long
-    Dim ixFz As Long
+    Dim outHdrs() As String        ' the block's columns, in output order
+    Dim outSrc() As String         ' SAFE key each output column comes from
+    Dim outIx() As Long            ' 1-based index of that key in the data array
+    Dim nOut As Long               ' number of output columns
+    Dim fzAt As Long               ' output position of Fz (the row filter)
+    Dim missing As String          ' output columns SAFE did not report
+    Dim mapNote As String          ' output columns taken from a renamed key
+    Dim matchedKey As String       ' the SAFE key a candidate list resolved to
     Dim keepRow() As Byte
     Dim kept() As Variant
     Dim nKept As Long
@@ -935,15 +948,71 @@ Public Sub WriteNodalReactions1()
     End If
 
     ' ---- 6. PREPROCESS -----------------------------------------------------
-    ' A row is dropped when its Fz cell reads as a zero; a blank cell is not a
-    ' zero and is kept. The column is located BY NAME in the keys SAFE reported,
-    ' so its position in the table does not matter.
-    ixFz = TableColumnIndex(hdrs, "Fz")
-    If ixFz = 0 Then
-        Say "WriteNodalReactions1: '" & REACT_TABLE & "' reports no 'Fz' column, " & _
-            "so no row could be filtered and nothing was written." & vbCrLf & vbCrLf & _
-            "SAFE reports " & ItemCount(hdrs) & " column(s).", vbExclamation
+    ' STEP 6a - WHICH columns reach the sheet. The block written below carries
+    ' EXACTLY the columns listed here, in this order - every other column SAFE
+    ' reports is left behind, so this list is the single place to change the
+    ' shape of the output:
+    '
+    '     outHdrs : Node | OutputCase | Fx | Fy | Fz | Mx | My | Mz
+    '
+    ' outSrc names, per output column and in the SAME order, the SAFE column
+    ' key(s) that column is taken from - several candidates separated by "|",
+    ' tried LEFT TO RIGHT, so the first one the model actually reports wins
+    ' (SAFE renames keys between versions, and a candidate list absorbs that).
+    ' "Node" is this block's own name for the point identifier: SAFE reports it
+    ' as part of the point's key rather than as a column called "Node".
+    '
+    ' Every column is resolved BY NAME against the keys SAFE returned - never by
+    ' position, so SAFE is free to reorder its columns without breaking this sub.
+    outHdrs = Split("Node,OutputCase,Fx,Fy,Fz,Mx,My,Mz", ",")
+    outSrc = Split("Node|UniqueName|Label,OutputCase,Fx,Fy,Fz,Mx,My,Mz", ",")
+
+    nOut = UBound(outHdrs) - LBound(outHdrs) + 1
+    ReDim outIx(0 To nOut - 1)
+    missing = ""
+    mapNote = ""
+    fzAt = -1
+    For c = 0 To nOut - 1
+        outIx(c) = FirstColumnIndex(hdrs, outSrc(c), matchedKey)
+        If outIx(c) = 0 Then
+            missing = missing & IIf(Len(missing) > 0, ", ", "") & outHdrs(c) & _
+                      " (looked for " & Replace(outSrc(c), "|", " / ") & ")"
+        Else
+            outSrc(c) = matchedKey          ' remember the key that matched
+            If Not SameKey(matchedKey, outHdrs(c)) Then
+                mapNote = mapNote & IIf(Len(mapNote) > 0, "  ", "") & _
+                          outHdrs(c) & " <- " & matchedKey
+            End If
+            If fzAt < 0 Then
+                If SameKey(outHdrs(c), "Fz") Then fzAt = c
+            End If
+        End If
+    Next c
+
+    If fzAt < 0 Then
+        ' The list above is fixed, so this is a mistake IN the list rather than a
+        ' model problem: Fz is both written and filtered on.
+        Say "WriteNodalReactions1: the output column list does not name 'Fz', " & _
+            "so there is nothing to filter the rows on and nothing was written.", _
+            vbExclamation
         Exit Sub
+    End If
+
+    If Len(missing) > 0 Then
+        Say "WriteNodalReactions1: '" & REACT_TABLE & "' does not report the " & _
+            "column(s) the output block needs, so NOTHING was written." & vbCrLf & _
+            vbCrLf & "Not found: " & missing & vbCrLf & _
+            "SAFE reports " & ItemCount(hdrs) & " column(s): " & Join(hdrs, ", ") & _
+            vbCrLf & vbCrLf & _
+            "If SAFE reports a different key for one of them, add it to the " & _
+            "candidate list (the ""a|b"" strings in step 6a) in front of the one " & _
+            "that is not there.", vbExclamation
+        Exit Sub
+    End If
+
+    If Len(mapNote) > 0 Then
+        LogMsg "WriteNodalReactions1: output column(s) taken from a renamed SAFE " & _
+               "key - " & mapNote
     End If
 
     nRows = 0
@@ -953,12 +1022,17 @@ Public Sub WriteNodalReactions1()
     nCols = UBound(data, 2)
     On Error GoTo Fail
 
+    ' STEP 6b - which ROWS reach the sheet, and the projection in one pass. A row
+    ' is dropped when its Fz cell reads as a zero; a blank cell is not a zero and
+    ' is kept. The survivors are copied COLUMN BY COLUMN into the output list, so
+    ' the block that comes out is nKept rows x nOut columns and holds nothing but
+    ' Node, OutputCase, Fx, Fy, Fz, Mx, My, Mz.
     nKept = 0
     If nRows > 0 And nCols > 0 Then
         ' which rows survive (1 = keep, 0 = drop)
         ReDim keepRow(1 To nRows)
         For r = 1 To nRows
-            fzText = SafeText(data(r, ixFz))
+            fzText = SafeText(data(r, outIx(fzAt)))
             If Len(fzText) > 0 And Val(fzText) = 0 Then
                 keepRow(r) = 0
             Else
@@ -967,28 +1041,33 @@ Public Sub WriteNodalReactions1()
             End If
         Next r
 
-        ' the survivors, as a block of exactly that many rows
+        ' the survivors, as a block of exactly that many rows - and of exactly
+        ' the output columns, in the output order
         If nKept > 0 Then
-            ReDim kept(1 To nKept, 1 To nCols)
+            ReDim kept(1 To nKept, 1 To nOut)
             k = 0
             For r = 1 To nRows
                 If keepRow(r) = 1 Then
                     k = k + 1
-                    For c = 1 To nCols
-                        kept(k, c) = data(r, c)
+                    For c = 0 To nOut - 1
+                        kept(k, c + 1) = data(r, outIx(c))
                     Next c
                 End If
             Next r
         End If
     End If
 
-    If nKept = 0 Then ReDim kept(1 To 0, 1 To 1)   ' a defined, empty block
+    If nKept = 0 Then ReDim kept(1 To 0, 1 To nOut)   ' a defined, empty block
 
     LogMsg "WriteNodalReactions1: '" & REACT_TABLE & "' - " & nRows & " row(s) read, " & _
-           nKept & " kept (rows with Fz = 0 dropped), " & nCols & " column(s)."
+           nKept & " kept (rows with Fz = 0 dropped), " & nCols & " column(s) read, " & _
+           nOut & " written (" & Join(outHdrs, ", ") & ")."
 
     ' ---- 7. write (PART 2 of the library pair) -----------------------------
-    printed = PrintTable(kept, REACT_SHEET, REACT_TOPLEFT, REACT_TABLE, hdrs, _
+    ' outHdrs travels with the block so that a labelled block (WriteHeader:=True)
+    ' would show the OUTPUT names, not SAFE's. Nothing is written here but the
+    ' eight columns of step 6a, flush on REACT_TOPLEFT (no title, no header row).
+    printed = PrintTable(kept, REACT_SHEET, REACT_TOPLEFT, REACT_TABLE, outHdrs, _
                          WriteTitle:=False, WriteHeader:=False)
 
     If printed < 0 Then
@@ -1137,6 +1216,42 @@ Private Function ColIndex(ByRef hdrs() As String, ByVal wanted As String) As Lon
         End If
     Next i
     ColIndex = 0
+End Function
+
+' 1-based index of the FIRST key in Candidates that the Headers array reports, or
+' 0 when none of them is there. Candidates is a "|"-separated list, tried LEFT TO
+' RIGHT, so ONE output column can be taken from any of several SAFE keys and the
+' first the model actually reports wins - which is how an output column survives
+' a key being renamed between SAFE versions. MatchedKey comes back with the key
+' that matched (as SAFE spells it), or "" when nothing matched, so the caller can
+' record which one was used.
+Private Function FirstColumnIndex( _
+    ByRef hdrs() As String, _
+    ByVal Candidates As String, _
+    Optional ByRef MatchedKey As String = "") As Long
+
+    Dim cand As Variant
+    Dim i As Long
+    Dim idx As Long
+
+    MatchedKey = ""
+    cand = Split(Candidates, "|")        ' Split always returns at least one item
+    For i = LBound(cand) To UBound(cand)
+        idx = ColIndex(hdrs, CStr(cand(i)))
+        If idx > 0 Then
+            MatchedKey = Trim$(CStr(cand(i)))
+            FirstColumnIndex = idx
+            Exit Function
+        End If
+    Next i
+End Function
+
+' True when two table keys are the SAME name - case- and space-insensitive, the
+' same comparison the column lookups use (SAFE can pad a key with spaces and
+' reports it in its own casing).
+Private Function SameKey(ByVal a As String, ByVal b As String) As Boolean
+    SameKey = (Replace(UCase$(Trim$(a)), " ", "") = _
+               Replace(UCase$(Trim$(b)), " ", ""))
 End Function
 
 ' Plain prefix test, case-insensitive: "Pile_1" also matches "Pile_10", which is

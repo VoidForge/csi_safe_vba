@@ -246,16 +246,33 @@ A site-specific entry point can also drive the two library halves itself, which 
 what `WriteNodalReactions1` does: after clearing the display combinations it reads
 `Joint Reactions` (verified against `reference/SAFE Input&Output Table Key
 List.csv`, Import Type 0 — a result table, so it can be read but never written
-back), drops every row whose `Fz` is zero, and prints what is left. Its settings
+back), **projects it onto a fixed column list**, drops every row whose `Fz` is
+zero, and prints what is left. Its settings
 are **local constants inside the sub** — `REACT_SHEET` / `REACT_TOPLEFT`
 (**top-left corner only**; the block lands there flush — no title row, no header
 row — and its columns extend right and down from there; a block too big for one
 sheet continues on `<sheet>_2`, `_3`, …), `REACT_LOADCASES` (cases, never
 combinations; empty = every load case the model reports) and `REACT_TABLE`. A key
 that is wrong for the model writes nothing and marks the block bold red
-(`MarkTableFailed`) instead of exporting plausible-looking data. The
-`Fz = 0` filter is one labelled block inside that sub, so it is the single place
-to change what rows reach the sheet.
+(`MarkTableFailed`) instead of exporting plausible-looking data.
+
+**Output columns.** The block that reaches the sheet holds **exactly** these
+columns, in this order — every other column SAFE reports is left behind:
+
+| Node | OutputCase | Fx | Fy | Fz | Mx | My | Mz |
+| ---- | ---------- | -- | -- | -- | -- | -- | -- |
+
+Two labelled blocks inside the sub are the single place to change the output:
+**step 6a** holds the column list (`outHdrs` — the eight names written — and
+`outSrc`, the SAFE key(s) each one is taken from), and **step 6b** holds the row
+filter (`Fz = 0` rows are dropped; a blank `Fz` cell is not a zero and is kept).
+Columns are resolved **by name** against the keys SAFE returned, never by
+position, so SAFE may reorder its columns freely; each `outSrc` entry is a
+`"a|b"` candidate list tried left to right, so a key SAFE renames between versions
+still resolves — `Node` is this block's own name for the point identifier and
+resolves to `UniqueName`, falling back to `Label` (the substitution is logged). A
+required column the model does not report writes **nothing** and says which key
+was looked for, rather than exporting a block with a missing or misaligned column.
 
 ## Table keys
 
