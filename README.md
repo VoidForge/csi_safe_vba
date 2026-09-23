@@ -375,3 +375,22 @@ with `ShowLog()`.
 - Reading tables works whether or not the model is locked; only the
   write-back (`WriteSAFETable`) may need the model unlocked, and only for a
   table SAFE reports as `ImportType` 2.
+
+## Python driver (`auto_analysis.py`)
+
+xlwings wrapper that runs the workbook's macros: the workbook must **already be
+open** in Excel and SAFE must be running with the model loaded.
+
+- `write_coords(coords: list[list[float]])` — writes the (x, y) pairs into
+  `Pile Coords`!`B3`:`C3` downwards (column `A`, the pile names, is left alone),
+  then runs `SAFE_Use.ApplyPileCoordinates1`.
+- `run_analysis()` — runs `SAFE_Use.RunAnalysis1`.
+- `write_reactions()` — runs `SAFE_Use.WriteNodalReactions1`.
+- `get_utilization() -> list[list[float]]` — reads `Pile Coords`!`H3`:`I…`,
+  one row per pile written by the **last** `write_coords` call; a blank or
+  non-numeric cell raises.
+
+Order: `write_coords` → `run_analysis` → `write_reactions` → `get_utilization`.
+A workbook that is not open, a worksheet/cell that cannot be read or a macro that
+cannot be run raises a Python exception; the `SAFE_Use` subs log their own
+failures instead of raising, so read those with `ShowLog` in the VBA IDE.
